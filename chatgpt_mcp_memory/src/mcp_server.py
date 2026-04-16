@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,7 +36,28 @@ def _data_dir() -> Path:
     env = os.environ.get("CHATGPT_MCP_DATA_DIR")
     if env:
         return Path(env).expanduser().resolve()
-    return Path(__file__).resolve().parents[1] / "data" / "derived"
+
+    # Fallbacks:
+    # - Source checkout: <repo>/src/mcp_server.py -> <repo>/data/derived
+    # - PyInstaller onefile: executable in <repo>/dist/minion-mcp -> <repo>/data/derived
+    here = Path(__file__).resolve()
+    repo_guess = here.parents[1]
+    candidate = repo_guess / "data" / "derived"
+    if candidate.exists():
+        return candidate
+
+    exe = Path(sys.argv[0]).resolve()
+    candidate2 = exe.parent.parent / "data" / "derived"
+    return candidate2
+
+
+# Ensure no warnings are emitted to stdout (breaks JSON-RPC framing over stdio).
+try:
+    from urllib3.exceptions import NotOpenSSLWarning  # type: ignore
+
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
 
 
 def _load_index() -> MemoryIndex:
