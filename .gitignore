@@ -22,3 +22,7 @@ reif_agent_profile.md
 
 # Secrets
 ssh/
+
+# Packaging build outputs
+chatgpt_mcp_memory/build/
+chatgpt_mcp_memory/dist/

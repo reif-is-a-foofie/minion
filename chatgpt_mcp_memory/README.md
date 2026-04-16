@@ -14,13 +14,38 @@ Nothing is uploaded. The index lives on local disk.
 - Pull the default model once: `ollama pull mistral:7b`
 - Claude Desktop installed
 
-## 1) Create a virtualenv + install deps
+### Recommended (non-technical friendly): `uv`
+
+`uv` installs a modern Python and dependencies for you (no system Python/pip drama).
+
+Install `uv` (macOS):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Restart your terminal so `uv` is on PATH.
+
+## 1) Install dependencies
+
+### Option A: `uv` (recommended)
+
+From this folder:
+
+```bash
+uv python install 3.11
+uv venv --python 3.11
+uv pip install -r requirements.txt
+```
+
+### Option B: classic venv (depends on system Python)
 
 From this folder:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -124,4 +149,29 @@ Ask Claude:
 ## Future sources (extensibility)
 
 Add new `ingest_*.py` scripts that convert a source into the same internal message/chunk format, then reuse `build_index.py`.
+
+Suggested connector pattern:
+
+- Add `src/ingest_<source>.py` that outputs either:
+  - an unzipped “raw” directory under `data/raw/`, plus a manifest, or
+  - a normalized JSONL of messages/documents
+- Keep the indexing surface stable:
+  - `build_index.py` consumes the export directory (or future normalized format) and always writes:
+    - `data/derived/chunks.jsonl`
+    - `data/derived/embeddings.npy`
+    - `data/derived/manifest.json`
+- Keep privacy defaults:
+  - local disk only
+  - MCP over stdio (no ports)
+  - strict `top_k` + `max_chars` caps
+
+## Packaging: Minion (macOS)
+
+This project is intended to be packaged as a macOS app/binary called **Minion**, so non-technical users don’t need Python.
+
+See `scripts/build_macos.sh` (builds a local `dist/minion-mcp` executable you can point Claude Desktop at).
+
+When using the packaged binary, your Claude Desktop config `command` should point to:
+
+- `.../chatgpt_mcp_memory/dist/minion-mcp`
 

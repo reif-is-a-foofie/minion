@@ -177,8 +177,8 @@ def build_quote_bank(messages: List[Dict]) -> str:
         lines.append(f"## {bucket}")
         lines.append("")
         for item in items[:120]:
-            lines.append(f'- \"{item[\"text\"]}\"')
-            lines.append(f'  Source conversation: {item[\"conversation_title\"]}')
+            lines.append(f"- \"{item['text']}\"")
+            lines.append(f"  Source conversation: {item['conversation_title']}")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -186,7 +186,14 @@ def build_quote_bank(messages: List[Dict]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract persona artifacts from a ChatGPT export directory.")
-    parser.add_argument("--export", required=True, help="Path to unzipped ChatGPT export root")
+    parser.add_argument(
+        "--export",
+        help="Path to unzipped ChatGPT export root (contains conversations-*.json).",
+    )
+    parser.add_argument(
+        "--chunks",
+        help="Alternative input: path to chunks.jsonl (as produced by build_index.py). Useful if raw export is unavailable.",
+    )
     parser.add_argument(
         "--derived-dir",
         default=str(Path(__file__).resolve().parents[1] / "data" / "derived"),
@@ -195,23 +202,46 @@ def main() -> None:
     parser.add_argument("--max-per-bucket", type=int, default=40)
     args = parser.parse_args()
 
-    export_dir = str(Path(args.export).expanduser().resolve())
     derived_dir = Path(args.derived_dir).expanduser().resolve()
     derived_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract user messages with text
     raw_messages: List[Dict] = []
-    for msg in iter_messages(export_dir, include_roles=("user",)):
-        if msg.content_type != "text" or not msg.text:
-            continue
-        raw_messages.append(
-            {
-                "conversation_title": msg.conversation_title,
-                "conversation_id": msg.conversation_id,
-                "create_time": msg.create_time,
-                "text": msg.text,
-            }
-        )
+    if args.chunks:
+        chunks_path = Path(args.chunks).expanduser().resolve()
+        with open(chunks_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if item.get("role") != "user":
+                    continue
+                text = normalize_text(str(item.get("text") or ""))
+                if not text:
+                    continue
+                raw_messages.append(
+                    {
+                        "conversation_title": item.get("conversation_title") or "(unknown)",
+                        "conversation_id": item.get("conversation_id") or "unknown",
+                        "create_time": item.get("create_time"),
+                        "text": text,
+                    }
+                )
+    elif args.export:
+        export_dir = str(Path(args.export).expanduser().resolve())
+        for msg in iter_messages(export_dir, include_roles=("user",)):
+            if msg.content_type != "text" or not msg.text:
+                continue
+            raw_messages.append(
+                {
+                    "conversation_title": msg.conversation_title,
+                    "conversation_id": msg.conversation_id,
+                    "create_time": msg.create_time,
+                    "text": msg.text,
+                }
+            )
+    else:
+        raise SystemExit("Provide --export or --chunks")
 
     counts: Counter = Counter()
     dedup: Dict[str, Dict] = {}
