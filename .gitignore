@@ -1,0 +1,24 @@
+.DS_Store
+
+# Local virtualenvs
+.venv/
+**/.venv/
+
+# ChatGPT exports / raw dumps
+conversations-*.json
+chat.html
+d9eced211a2a0b9cd1b2d52f595ee063aea7ff88cddbcaad683ae4aa25df7992-2026-03-21-20-25-15-b54da2dcfb0a4295aae2c768c88d320c/
+*.zip
+
+# Derived artifacts (often personal / large)
+chatgpt_mcp_memory/data/raw/
+chatgpt_mcp_memory/data/derived/
+agent/memory_chunks.jsonl
+agent/memory_embeddings.npy
+agent/memory_manifest.json
+persona_sourcebook.md
+persona_quote_bank.md
+reif_agent_profile.md
+
+# Secrets
+ssh/
