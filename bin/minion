@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+def _repo_root() -> Path:
+    # When installed via Homebrew, this script lives at: <libexec>/bin/minion
+    return Path(__file__).resolve().parents[1]
+
+
+def _chatgpt_mcp_dir() -> Path:
+    return _repo_root() / "chatgpt_mcp_memory"
+
+
+def _src(script_name: str) -> Path:
+    return _chatgpt_mcp_dir() / "src" / script_name
+
+
+def _run(cmd: List[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> str:
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    )
+    return p.stdout
+
+
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def _default_workspace_dir() -> Path:
+    return Path.home() / "minion_private"
+
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _venv_python(workspace_dir: Path) -> Path:
+    # uv venv and venv both create workspace/.venv
+    return workspace_dir / ".venv" / "bin" / "python"
+
+
+def _ensure_python_env(workspace_dir: Path) -> Path:
+    """
+    Prefer uv (fast, less system-python drama). Fall back to venv.
+    Returns the python executable path to use for subsequent steps.
+    """
+    vpy = _venv_python(workspace_dir)
+    if vpy.exists():
+        return vpy
+
+    uv = _which("uv")
+    req = _chatgpt_mcp_dir() / "requirements.txt"
+    _ensure_dir(workspace_dir)
+
+    if uv:
+        _run([uv, "python", "install", "3.11"])
+        _run([uv, "venv", "--python", "3.11", str(workspace_dir / ".venv")])
+        _run([uv, "pip", "install", "-r", str(req)])
+        if vpy.exists():
+            return vpy
+
+    # Fallback: system python venv
+    py = _which("python3") or _which("python")
+    if not py:
+        raise SystemExit("Missing python. Install Python 3 or install `uv`.")
+    _run([py, "-m", "venv", str(workspace_dir / ".venv")])
+    _run([str(vpy), "-m", "pip", "install", "--upgrade", "pip"])
+    _run([str(vpy), "-m", "pip", "install", "-r", str(req)])
+    return vpy
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    print("minion doctor")
+    print("")
+    print(f"- repo_root: {_repo_root()}")
+    print(f"- chatgpt_mcp_memory: {_chatgpt_mcp_dir()}")
+
+    uv = _which("uv")
+    print(f"- uv: {uv or 'missing'}")
+
+    ollama = _which("ollama")
+    print(f"- ollama: {ollama or 'missing'}")
+    if ollama:
+        try:
+            out = _run(["ollama", "list"])
+            print("- ollama list: ok")
+            # keep output short
+            lines = [ln for ln in out.splitlines() if ln.strip()]
+            for ln in lines[:8]:
+                print(f"  {ln}")
+            if len(lines) > 8:
+                print("  …")
+        except Exception:
+            print("- ollama list: failed (is ollama running?)")
+
+    return 0
+
+
+def _parse_ingest_output(out: str) -> Tuple[str, str]:
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise RuntimeError(f"Unexpected ingest output:\n{out}")
+    return lines[0], lines[1]
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    workspace_dir = Path(args.workspace).expanduser().resolve()
+    _ensure_dir(workspace_dir)
+
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = workspace_dir / "runs" / stamp
+    raw_out_dir = run_dir / "raw"
+    derived_dir = run_dir / "derived"
+    _ensure_dir(raw_out_dir)
+    _ensure_dir(derived_dir)
+
+    vpy = _ensure_python_env(workspace_dir)
+
+    zip_path = Path(args.export_zip).expanduser().resolve()
+    if not zip_path.exists():
+        raise SystemExit(f"Missing export zip: {zip_path}")
+
+    print(f"Workspace: {workspace_dir}")
+    print(f"Run dir:   {run_dir}")
+    print("")
+
+    # 1) Ingest zip (unzip into run_dir/raw/*)
+    print("1) Ingesting export zip…")
+    ingest_out = _run([str(vpy), str(_src("ingest_chatgpt_export.py")), str(zip_path), "--out", str(raw_out_dir)])
+    export_root, manifest_path = _parse_ingest_output(ingest_out)
+    export_root_path = Path(export_root).expanduser().resolve()
+    print(f"   export_root: {export_root_path}")
+    print(f"   manifest:    {manifest_path}")
+    print("")
+
+    # 2) Build semantic index into run_dir/derived
+    print("2) Building semantic index…")
+    _run([str(vpy), str(_src("build_index.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
+    print(f"   derived_dir: {derived_dir}")
+    print("")
+
+    # 3) Persona artifacts (sourcebook + quote bank)
+    print("3) Extracting persona evidence…")
+    _run([str(vpy), str(_src("persona_extract.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
+    print("")
+
+    # 4) Generate core_profile.md from evidence (local Ollama)
+    print("4) Generating core profile (local Ollama)…")
+    core_profile_path = run_dir / "core_profile.md"
+    agent_profile_path = run_dir / "agent_core_profile.md"
+    gen_out = _run(
+        [
+            str(vpy),
+            str(_src("generate_core_profile.py")),
+            "--derived-dir",
+            str(derived_dir),
+            "--model",
+            str(args.model),
+            "--out-chatgpt-mcp",
+            str(core_profile_path),
+            "--out-agent",
+            str(agent_profile_path),
+        ]
+    )
+    for ln in [ln.strip() for ln in gen_out.splitlines() if ln.strip()][-3:]:
+        print(f"   {ln}")
+    print("")
+
+    print("Done.")
+    print("")
+    print(f"- Pasteable profile: {core_profile_path}")
+    print(f"- Derived data dir (set CHATGPT_MCP_DATA_DIR to this): {derived_dir}")
+    print("")
+    print("Next:")
+    print(f'  minion mcp --derived-dir "{derived_dir}"')
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    if not derived_dir.exists():
+        raise SystemExit(f"Missing derived dir: {derived_dir}")
+
+    workspace_dir = Path(args.workspace).expanduser().resolve() if args.workspace else _default_workspace_dir()
+    vpy = _ensure_python_env(workspace_dir)
+
+    env = dict(os.environ)
+    env["CHATGPT_MCP_DATA_DIR"] = str(derived_dir)
+    # Run MCP server over stdio; Claude Desktop starts this process.
+    os.execve(
+        str(vpy),
+        [str(vpy), str(_src("mcp_server.py"))],
+        env,
+    )
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="minion", description="Local-first memory + persona toolkit.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_doctor = sub.add_parser("doctor", help="Check local prerequisites.")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_setup = sub.add_parser("setup", help="Ingest export.zip and build everything into a private workspace.")
+    p_setup.add_argument("--export-zip", required=True, help="Path to ChatGPT export ZIP")
+    p_setup.add_argument("--workspace", default=str(_default_workspace_dir()), help="Private workspace directory")
+    p_setup.add_argument("--model", default="mistral:7b", help="Ollama model for profile generation")
+    p_setup.set_defaults(func=cmd_setup)
+
+    p_mcp = sub.add_parser("mcp", help="Run the MCP server pointing at a derived directory.")
+    p_mcp.add_argument("--derived-dir", required=True, help="Directory containing chunks/embeddings/manifest")
+    p_mcp.add_argument("--workspace", default=str(_default_workspace_dir()), help="Workspace to host the venv")
+    p_mcp.set_defaults(func=cmd_mcp)
+
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

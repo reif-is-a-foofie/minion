@@ -1,25 +1,41 @@
 # What the heck is this thing and why should I care about it?
 
-Well, like me you are probably realizing by now that you have wasted a lot of your life reading slop from ChatGPT when you could have been making progress with Claude. 
-I made my move to Claude recently and I realized, well, I have my whole life on GPT. That thing knows more about me than my doctor, my shrink and Siri combined times 6. 
-And Claude doesn't know me from Adam other than it knows I'm not Adam, at least... most likely not Adam. 
+Well, like me, you are probably realizing by now that you have wasted a lot of your life reading slop from ChatGPT when you could have been making progress with Claude.
+I made my move to Claude recently and I realized, well, I have my whole life on GPT. That thing knows more about me than my doctor, my shrink, and Siri combined times 6.
+And Claude doesn't know me from Adam other than it knows I'm not Adam. At least... most likely not Adam.
 
-In any case, OpenAI allows you to export all of yoru chats. It takes a few days. 
-Then I needed to push that (context) back into Claude. 
-But how?? I cant just load 30 million messages into Claude (real message count BTW, wild)
-And given Claude spends more tokens than an kid at nickle-mania who just drank his first redbull....
+In any case, OpenAI allows you to export all of your chats. It takes a few days.
+Then I needed to push that (context) back into Claude.
+But how?? I can’t just load 30 million messages into Claude (real message count BTW, wild).
+And given Claude spends more tokens than a kid at nickel-mania who just drank his first Red Bull....
 
-I needed a solution. 
+I needed a solution.
 
-Naturally we go the encoding and semantic search route. Hook it up to an MCP that runs locally - so at run time, Claude can query my personal data and ONLY take in the context that matters. 
+Naturally we go the encoding + semantic search route. Hook it up to an MCP that runs locally — so at run time, Claude can query my personal data and ONLY take in the context that matters.
 
-Its alpha, if you stretch alpha hard enough - lets be honest, bad things could happen. But at least I am committed to using my own software on my own personal set up. 
+It’s alpha. If you stretch alpha hard enough — let’s be honest — bad things could happen. But at least I am committed to using my own software on my own personal setup.
 
-Ping me with questions - 
+Ping me with questions —
 
 Reif
 
 -reif@thegoodproject.net
+
+## Install (internal teammates)
+
+If you’re on a Mac and have Homebrew:
+
+```bash
+brew tap reif-is-a-foofie/minion
+brew install minion
+minion doctor
+```
+
+To run the full setup from an export ZIP (creates a private workspace in `~/minion_private`):
+
+```bash
+minion setup --export-zip "/path/to/chatgpt-export.zip"
+```
 
 ## What you do with it
 

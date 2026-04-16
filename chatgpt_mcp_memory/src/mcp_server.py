@@ -10,6 +10,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+# Ensure no warnings are emitted to stdout (breaks JSON-RPC framing over stdio).
+# Must run before importing libraries that may trigger warnings at import time.
+try:
+    from urllib3.exceptions import NotOpenSSLWarning  # type: ignore
+
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
+
 from sentence_transformers import SentenceTransformer
 
 
@@ -49,15 +59,6 @@ def _data_dir() -> Path:
     exe = Path(sys.argv[0]).resolve()
     candidate2 = exe.parent.parent / "data" / "derived"
     return candidate2
-
-
-# Ensure no warnings are emitted to stdout (breaks JSON-RPC framing over stdio).
-try:
-    from urllib3.exceptions import NotOpenSSLWarning  # type: ignore
-
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-except Exception:
-    pass
 
 
 def _load_index() -> MemoryIndex:
