@@ -13,12 +13,10 @@ import numpy as np
 
 # Ensure no warnings are emitted to stdout (breaks JSON-RPC framing over stdio).
 # Must run before importing libraries that may trigger warnings at import time.
-try:
-    from urllib3.exceptions import NotOpenSSLWarning  # type: ignore
-
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-except Exception:
-    pass
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 v2 only supports OpenSSL 1\.1\.1\+.*LibreSSL.*",
+)
 
 from sentence_transformers import SentenceTransformer
 
