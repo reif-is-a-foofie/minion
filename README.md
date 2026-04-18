@@ -24,10 +24,12 @@ Reif
 
 ## Easiest way (guided)
 
+**Prefer the interactive flow:** open Terminal, type **`minion`**, press Enter — no subcommands, no flags. It starts a short **prompted setup** (paste your export path, confirm where files go, pick your Ollama model or accept the default). Same entry also works as **`minion start`**, **`minion go`**, or **`minion wizard`**.
+
 **One run does the whole pipeline** — you are not supposed to chase five separate scripts. After you point Minion at your export, it unpacks, builds the search index, pulls persona quotes, calls your **local** Ollama model to write `core_profile.md`, and **merges the MCP entry into Claude Desktop’s config** for you (with a backup of the old file).
 
 1. Install Minion (Homebrew or from this repo). Have **Ollama** installed with the model you use for the profile (default `mistral:7b`).
-2. In Terminal, run **`minion`** with nothing after it (or `minion start` / `minion setup --export …`).
+2. Run **`minion`** (interactive, as above). **Or** for scripts/CI: `minion setup --export /path/to/export.zip`.
 3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
 4. Wait until it finishes (this can take a while on a big export).
 5. **You:** put text **into Claude itself** so the model knows how to behave — not just “connecting wires.” Minion copies **`retrieval_policy.md`** next to your profile in each run folder; paste **both** that file and **`core_profile.md`** into **Claude → Custom Instructions** (and/or project instructions). That tells Claude **when to call** `search_memory` (MCP), not only that the tool exists.
