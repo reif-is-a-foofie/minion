@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -16,14 +17,61 @@ class ExportFile:
     size_bytes: int
 
 
-def _safe_name(s: str) -> str:
-    return "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_", ".")).strip("._-") or "export"
+def _short_dest_dir_name(zip_path: Path, stamp: str) -> str:
+    """Avoid very long paths (macOS ENAMETOOLONG) from OpenAI’s huge zip basename."""
+    h = hashlib.sha256(zip_path.name.encode("utf-8")).hexdigest()[:12]
+    return f"export_{h}_{stamp}"
+
+
+_MAX_COMPONENT = 120
+
+
+def _shorten_component(name: str) -> str:
+    if len(name) <= _MAX_COMPONENT:
+        return name
+    stem, ext = os.path.splitext(name)
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    keep = max(0, _MAX_COMPONENT - len(ext) - 1 - len(digest))
+    prefix = stem[:keep] if keep else ""
+    return f"{prefix}~{digest}{ext}"
 
 
 def unzip_to(zip_path: Path, dest_dir: Path) -> None:
+    """
+    Extract zip member-by-member. Shorten path components that would exceed typical
+    filesystem limits (ChatGPT exports can include extremely long image filenames).
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(dest_dir)
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            parts = info.filename.replace("\\", "/").split("/")
+            safe_parts = [_shorten_component(p) for p in parts if p]
+            rel = "/".join(safe_parts)
+            dest_root = dest_dir.resolve()
+            target = (dest_dir / rel).resolve()
+            try:
+                target.relative_to(dest_root)
+            except ValueError:
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                target = dest_dir / (
+                    hashlib.sha256(info.filename.encode("utf-8")).hexdigest()[:24] + Path(info.filename).suffix
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with zf.open(info, "r") as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+            except OSError:
+                flat = dest_dir / (
+                    hashlib.sha256(info.filename.encode("utf-8")).hexdigest()[:24] + Path(info.filename).suffix
+                )
+                flat.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, open(flat, "wb") as out:
+                    shutil.copyfileobj(src, out)
 
 
 def find_export_root(unzipped_dir: Path) -> Path:
@@ -88,7 +136,7 @@ def main() -> None:
     out_base.mkdir(parents=True, exist_ok=True)
 
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    dest = out_base / f"{_safe_name(zip_path.stem)}_{stamp}"
+    dest = out_base / _short_dest_dir_name(zip_path, stamp)
     if dest.exists():
         raise FileExistsError(str(dest))
 
