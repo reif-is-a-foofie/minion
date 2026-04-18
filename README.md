@@ -47,6 +47,8 @@ brew install minion
 minion doctor
 ```
 
+Maintainers: bumping the tap after a release is documented in [docs/homebrew.md](docs/homebrew.md).
+
 To run the **same full pipeline** non-interactively (creates a workspace; default is `~/minion_private` unless you pass `--workspace`):
 
 ```bash
