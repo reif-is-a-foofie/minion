@@ -22,6 +22,22 @@ Reif
 -reif@thegoodproject.net
 
 
+## Desktop app (drop-zone UI)
+
+There's a native-feeling desktop app now: drop any file onto the window and
+every MCP-speaking agent (Claude Desktop, Cursor, etc.) can read it. Built
+with Tauri + SvelteKit on top of the same SQLite + sqlite-vec store the CLI
+uses.
+
+```bash
+cd desktop
+npm install
+npm run tauri dev
+```
+
+See [`desktop/README.md`](./desktop/README.md) for architecture and build
+notes.
+
 ## Easiest way (guided)
 
 **Prefer the interactive flow:** open Terminal, type **`minion`**, press Enter — no subcommands, no flags. It starts a short **prompted setup** (paste your export path, confirm where files go, pick your Ollama model or accept the default). Same entry also works as **`minion start`**, **`minion go`**, or **`minion wizard`**.
