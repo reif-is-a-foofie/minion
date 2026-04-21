@@ -166,23 +166,42 @@ export async function deleteSource(body: { path?: string; source_id?: string }):
 
 export type ConnState = "connecting" | "open" | "closed" | "unreachable";
 
+export type OpenEventsHandle = {
+  stop: () => void;
+  /** When Rust finishes bootstrapping the sidecar, call this so WS retries use short backoff again (avoids sitting on "offline" after long pip). */
+  resetReconnectBudget: () => void;
+};
+
 /// Connect to the sidecar's `/events` WebSocket with bounded retries.
-/// Backoff schedule: 1.5s, 3s, 6s, 12s, 20s (capped). After ~8 attempts
-/// without a single successful open, flip to "unreachable" so the UI can
-/// show an actionable error instead of silently reconnecting forever.
+/// First-launch pip can take many minutes; keep trying long enough before
+/// "unreachable". Backoff: 1.5s base, ×1.6^attempt, 20s cap.
 export async function openEvents(
   onMessage: (e: EventMsg) => void,
   onStatus?: (s: ConnState) => void,
-): Promise<() => void> {
+): Promise<OpenEventsHandle> {
   let closed = false;
   let ws: WebSocket | null = null;
   let attempts = 0;
   let everOpened = false;
-  const MAX_ATTEMPTS_BEFORE_UNREACHABLE = 8;
+  /** ~15+ min of typical refuses before showing offline (pip + slow disks). */
+  const MAX_ATTEMPTS_BEFORE_UNREACHABLE = 48;
   const backoff = (n: number) => Math.min(1500 * Math.pow(1.6, n), 20000);
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleReconnect = () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, backoff(attempts));
+  };
 
   const connect = async () => {
     if (closed) return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     attempts += 1;
     onStatus?.("connecting");
     try {
@@ -195,7 +214,7 @@ export async function openEvents(
       } else {
         onStatus?.("closed");
       }
-      setTimeout(connect, backoff(attempts));
+      scheduleReconnect();
       return;
     }
     ws.onopen = () => {
@@ -217,7 +236,7 @@ export async function openEvents(
       } else {
         onStatus?.("closed");
       }
-      setTimeout(connect, backoff(attempts));
+      scheduleReconnect();
     };
     ws.onerror = () => {
       if (!everOpened && attempts >= MAX_ATTEMPTS_BEFORE_UNREACHABLE) {
@@ -229,9 +248,26 @@ export async function openEvents(
   };
   await connect();
 
-  return () => {
-    closed = true;
-    ws?.close();
+  return {
+    stop: () => {
+      closed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      ws?.close();
+    },
+    resetReconnectBudget: () => {
+      attempts = 0;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (!closed && !everOpened) {
+        onStatus?.("connecting");
+        void connect();
+      }
+    },
   };
 }
 

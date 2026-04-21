@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash src-tauri/scripts/sync_sidecar.sh && npm run build",
+    "beforeBuildCommand": "bash src-tauri/scripts/sync_sidecar.sh && bash src-tauri/scripts/ensure_uv.sh && npm run build",
     "frontendDist": "../build"
   },
   "app": {
@@ -35,7 +35,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/sidecar": "sidecar"
+      "resources/sidecar": "sidecar",
+      "resources/bin": "bin"
     }
   }
 }

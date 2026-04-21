@@ -93,16 +93,21 @@ dependencies into the user’s data directory.
 
 ## First launch (new machine)
 
-The app needs **Python 3.10+** on disk (not only in your shell `PATH` — Finder
-launched apps often miss Homebrew). It creates **`data/venv`** and runs
-**`pip install -r`** the bundled requirements (**network required**).
+Release builds bundle **[uv](https://docs.astral.sh/uv/)** (`scripts/ensure_uv.sh`
+runs during `npm run tauri build`). **If Python 3.10+ is already on PATH**
+(GUI apps often lack Homebrew paths), Minion creates **`data/venv`** with it.
+**If not**, the shell uses **`uv`** to download **CPython 3.12** into
+**`managed-python/`** under your data dir, creates **`venv/`**, then runs **`pip install -r`**
+(the sidecar deps). **Network is required** on first launch.
 
-If setup fails: open **Settings → File logs** and read **`pip-bootstrap.log`**
-(full pip stdout/stderr), **`minion-desktop.log`**, and **`sidecar.log`**.
-Common fixes: install Python from [python.org](https://www.python.org/downloads/)
-or Homebrew; on macOS with the python.org installer, run **Install
-Certificates.command** if pip reports SSL errors; delete **`…/Minion/data/venv`**
-and relaunch to retry a half-finished install.
+Developers running **`npm run tauri dev`** usually have Python already; if you test
+the no-Python path, run `bash desktop/src-tauri/scripts/ensure_uv.sh` once so
+`resources/bin/uv` exists locally (not committed — rebuilt each release bundle).
+
+If setup fails: **Settings → File logs** → **`pip-bootstrap.log`**, **`minion-desktop.log`**,
+**`sidecar.log`**. SSL errors from pip: macOS python.org installs may need **Install
+Certificates.command**. Retry: delete **`venv`** (and optionally **`managed-python`**)
+under your data dir, relaunch.
 
 CI runs the same dependency set from an empty venv on every push (see
 `.github/workflows/virgin-python.yml`).

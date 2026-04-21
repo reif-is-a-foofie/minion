@@ -38,3 +38,4 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 # sync_sidecar.sh output; regenerated on every build
 desktop/src-tauri/resources/sidecar/
+desktop/src-tauri/resources/bin/
