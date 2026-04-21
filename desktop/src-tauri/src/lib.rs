@@ -579,6 +579,7 @@ fn bootstrap_venv_with_managed_uv(
             venv_dir.to_string_lossy().as_ref(),
             "--python",
             MANAGED_PYTHON_SPEC,
+            "--seed",
         ])
         .env("UV_PYTHON_INSTALL_DIR", &install_dir);
     forward_proxy_env(&mut cmd_venv);
@@ -612,7 +613,24 @@ fn bootstrap_venv(
     data_dir: &Path,
     requirements: &Path,
 ) -> Result<PathBuf, String> {
+    bootstrap_venv_impl(app, data_dir, requirements, 0)
+}
+
+fn bootstrap_venv_impl(
+    app: &AppHandle,
+    data_dir: &Path,
+    requirements: &Path,
+    depth: u8,
+) -> Result<PathBuf, String> {
     let py = venv_python(data_dir);
+    let venv_dir = data_dir.join("venv");
+    let emit = |stage: &str, message: &str| {
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({"state": stage, "message": message}),
+        );
+    };
+
     // Already bootstrapped AND core deps importable? Fast-path return.
     if py.exists() && venv_has_core(&py) {
         dbg("bootstrap", serde_json::json!({"state": "cached", "python": py}));
@@ -620,12 +638,30 @@ fn bootstrap_venv(
         return Ok(py);
     }
 
-    let emit = |stage: &str, message: &str| {
-        let _ = app.emit(
-            "sidecar://status",
-            serde_json::json!({"state": stage, "message": message}),
+    // Interpreter exists but pip doesn't (e.g. legacy uv venv): delete and recreate — no manual step.
+    if py.exists() && !venv_has_pip(&py) {
+        shell_log(
+            "WARN",
+            "venv exists but pip is missing; removing it so setup can recreate…",
         );
-    };
+        emit(
+            "bootstrapping",
+            "Repairing Python environment (pip was missing)…",
+        );
+        fs::remove_dir_all(&venv_dir).map_err(|e| {
+            let msg = format!(
+                "Could not remove incomplete venv at {}: {e}",
+                venv_dir.display()
+            );
+            emit("error", &msg);
+            shell_log("ERROR", &msg);
+            msg
+        })?;
+        dbg(
+            "bootstrap",
+            serde_json::json!({"state": "venv_removed_pipless", "venv": venv_dir}),
+        );
+    }
 
     // Prefer system Python 3.10+. If none (common for Finder-launched macOS apps),
     // use bundled `uv` to download CPython — no manual python.org install.
@@ -735,6 +771,29 @@ fn bootstrap_venv(
     );
 
     if !pip_out.status.success() {
+        let pip_missing = pip_combined.contains("No module named pip")
+            || pip_combined.contains("No module named 'pip'");
+        if depth == 0 && pip_missing {
+            shell_log(
+                "WARN",
+                "pip missing during bootstrap; removing venv and retrying setup once…",
+            );
+            emit("bootstrapping", "Repairing Python environment…");
+            fs::remove_dir_all(&venv_dir).map_err(|e| {
+                let msg = format!(
+                    "Could not remove broken venv at {}: {e}",
+                    venv_dir.display()
+                );
+                emit("error", &msg);
+                shell_log("ERROR", &msg);
+                msg
+            })?;
+            dbg(
+                "bootstrap",
+                serde_json::json!({"state": "retry_after_pip_missing", "venv": venv_dir}),
+            );
+            return bootstrap_venv_impl(app, data_dir, requirements, 1);
+        }
         let tail = tail_utf8(&pip_combined, 2800);
         let ssl_hint = if pip_combined.contains("SSL")
             || pip_combined.contains("CERTIFICATE_VERIFY_FAILED")
@@ -767,6 +826,16 @@ fn venv_has_core(py: &Path) -> bool {
             "-c",
             "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; from pypdf import PdfReader; import trafilatura",
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn venv_has_pip(py: &Path) -> bool {
+    Command::new(py)
+        .args(["-m", "pip", "--version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

@@ -106,8 +106,9 @@ the no-Python path, run `bash desktop/src-tauri/scripts/ensure_uv.sh` once so
 
 If setup fails: **Settings → File logs** → **`pip-bootstrap.log`**, **`minion-desktop.log`**,
 **`sidecar.log`**. SSL errors from pip: macOS python.org installs may need **Install
-Certificates.command**. Retry: delete **`venv`** (and optionally **`managed-python`**)
-under your data dir, relaunch.
+Certificates.command**. The app **automatically deletes and recreates** a **`venv`** that has
+no **`pip`** (usually no manual step). If setup is still stuck, delete **`venv`** (and
+optionally **`managed-python`**) under your data dir yourself and relaunch.
 
 CI runs the same dependency set from an empty venv on every push (see
 `.github/workflows/virgin-python.yml`).
@@ -133,6 +134,8 @@ There are three levels; pick what matches how deep you want to go:
    mkdir -p "$MINION_DATA_DIR/inbox"
    cd desktop && npm install && npm run tauri dev
    ```
+
+   To exercise **bundled uv + managed Python** (no `python3` on PATH — the same path as many GUI launches), ensure **`src-tauri/resources/bin/uv`** exists first (`bash src-tauri/scripts/ensure_uv.sh`). Otherwise the dev shell may use your normal `python3`.
 
    Watch for the first-run overlay (venv/pip), then header **ready** and **Contents** loading. In another terminal:
 
