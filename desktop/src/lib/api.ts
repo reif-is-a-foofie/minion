@@ -79,7 +79,8 @@ export type EventMsg =
   | { type: "ingest_failed"; path: string; active?: Active }
   | { type: "source_updated"; result: Record<string, unknown>; counts: any; active?: Active }
   | { type: "source_removed"; key: string; counts: any }
-  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
+  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any }
+  | { type: "ingest_delight"; path: string; line: string };
 
 let cachedConfig: AppConfig | null = null;
 

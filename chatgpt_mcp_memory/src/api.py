@@ -61,6 +61,43 @@ import numpy as np
 log = logging.getLogger("minion.api")
 
 
+def _schedule_ingest_delight(result: Dict[str, Any], batch_total: int) -> None:
+    """Fire-and-forget tiny LLM one-liner; never blocks ingest."""
+    if not result.get("source_id"):
+        return
+    try:
+        from ingest_delight import should_run_delight, generate_delight_line
+    except Exception:
+        return
+    if not should_run_delight(batch_total):
+        return
+    path_str = result.get("path")
+    if not path_str:
+        return
+
+    def _worker() -> None:
+        try:
+            line = generate_delight_line(
+                Path(path_str),
+                str(result.get("kind") or "?"),
+                int(result.get("chunk_count") or 0),
+                db_path=State.db_path,
+                source_id=str(result["source_id"]),
+            )
+            if line:
+                _schedule_broadcast(
+                    {
+                        "type": "ingest_delight",
+                        "path": path_str,
+                        "line": line,
+                    }
+                )
+        except Exception:
+            log.debug("ingest_delight worker failed", exc_info=True)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Shared state (one connection per thread; the asyncio loop gets its own)
 # ---------------------------------------------------------------------------
@@ -703,6 +740,7 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
                         "counts": _counts(),
                         "active": snap,
                     })
+                    _schedule_ingest_delight(res, len(files))
                 else:
                     await _broadcast({
                         "type": "ingest_skipped",
@@ -765,6 +803,8 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
                 "counts": _counts(),
             }
         )
+        if res.get("source_id"):
+            _schedule_ingest_delight(res, 1)
         return res
 
     asyncio.create_task(_run_ingest())

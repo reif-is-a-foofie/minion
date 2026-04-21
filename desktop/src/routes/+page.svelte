@@ -34,7 +34,8 @@
   let searchResults = $state<SearchHit[]>([]);
   let searching = $state(false);
   let dragging = $state(false);
-  let ingestFeed = $state<{ id: string; path: string; status: string; ts: number }[]>([]);
+  type EmbedAnim = { shownDone: number; targetDone: number; total: number };
+  let ingestFeed = $state<{ id: string; path: string; status: string; ts: number; embed?: EmbedAnim }[]>([]);
   let active = $state<Active>({ root: null, total: 0, done: 0, added: 0, skipped: 0 });
   let connecting = $state(false);
   let connectMsg = $state<string>("");
@@ -49,6 +50,8 @@
   // Rolling per-file line id, so subsequent progress events for the same
   // path rewrite a single terminal line instead of stacking.
   let currentRow: Record<string, string> = {};
+  /** One terminal row updating in place while the same skip reason repeats in a batch. */
+  let skipRollup: { key: string; feedId: string } | null = null;
   let conn = $state<ConnState>("connecting");
   let lastHeartbeat = $state<number>(0);
   let restarting = $state(false);
@@ -203,7 +206,8 @@
    * Map a status line to a color class. Order matters: match terminal states
    * before in-flight ones so "ingested" doesn't get tagged as "parsing".
    */
-  function statusClass(s: string): string {
+  function statusClass(s: string, pathHint?: string): string {
+    if ((pathHint ?? "").includes("✨")) return "delight";
     const t = s.toLowerCase();
     if (/\b(error|failed|parse-error)\b/.test(t)) return "err";
     // "deferred" = the app will retry this one automatically (e.g. waiting
@@ -214,35 +218,108 @@
       return "saved";
     if (/\bcopied\b|\bunpacked\b|\bextracted\b|\bloaded\b|\bparsed\b|\bready\b|\brestarted\b/.test(t))
       return "ok";
-    if (/\bskipped\b|\bempty\b|image-only|missing-deps|no-text|unsupported/.test(t))
+    if (/\bskipped\b|\bskipping\b|\bempty\b|image-only|missing-deps|no-text|unsupported/.test(t))
       return "warn";
     if (/copying…|parsing|embedding|unpacking|extracting|pulling|restart requested/.test(t))
       return "progress";
     return "";
   }
 
-  function pushFeed(path: string, state: string): string {
+  function pushFeed(path: string, state: string, embed?: EmbedAnim): string {
     const ts = Date.now();
     const id = `${path}:${ts}:${Math.random().toString(36).slice(2, 6)}`;
     // Append at the bottom and cap history, like a standard terminal.
-    ingestFeed = [...ingestFeed.slice(-299), { id, path, status: state, ts }];
+    ingestFeed = [
+      ...ingestFeed.slice(-299),
+      embed ? { id, path, status: state, ts, embed } : { id, path, status: state, ts },
+    ];
     scheduleScroll();
     return id;
   }
 
-  function updateFeed(id: string, patch: { path?: string; status?: string }) {
-    ingestFeed = ingestFeed.map((row) =>
-      row.id === id
-        ? { ...row, path: patch.path ?? row.path, status: patch.status ?? row.status, ts: Date.now() }
-        : row,
-    );
+  function updateFeed(
+    id: string,
+    patch: { path?: string; status?: string; embed?: EmbedAnim | null },
+  ) {
+    ingestFeed = ingestFeed.map((row) => {
+      if (row.id !== id) return row;
+      let embed: EmbedAnim | undefined = row.embed;
+      if (patch.embed === null) embed = undefined;
+      else if (patch.embed !== undefined) embed = patch.embed;
+      return {
+        ...row,
+        path: patch.path ?? row.path,
+        status: patch.status ?? row.status,
+        embed,
+        ts: Date.now(),
+      };
+    });
     scheduleScroll();
+  }
+
+  let embedRafHandle: number | null = null;
+  function cancelEmbedRaf() {
+    if (embedRafHandle != null) {
+      cancelAnimationFrame(embedRafHandle);
+      embedRafHandle = null;
+    }
+  }
+
+  /** Ease the displayed embed count toward the server target (no big jumps). */
+  function scheduleEmbedRaf() {
+    if (embedRafHandle != null) return;
+    embedRafHandle = requestAnimationFrame(function tick() {
+      embedRafHandle = null;
+      let changed = false;
+      ingestFeed = ingestFeed.map((row) => {
+        if (!row.embed) return row;
+        const { shownDone, targetDone, total } = row.embed;
+        if (shownDone === targetDone) return row;
+        const delta = targetDone - shownDone;
+        // Larger gaps move faster so long runs still feel responsive.
+        const step = Math.max(1, Math.ceil(Math.abs(delta) / 6));
+        const next = shownDone + Math.sign(delta) * Math.min(step, Math.abs(delta));
+        changed = true;
+        const pct = total ? Math.floor((next / total) * 100) : 0;
+        return {
+          ...row,
+          embed: { ...row.embed, shownDone: next, targetDone, total },
+          status: `embedding ${next}/${total} (${pct}%)`,
+          ts: Date.now(),
+        };
+      });
+      if (changed) {
+        scheduleScroll();
+        scheduleEmbedRaf();
+      }
+    });
+  }
+
+  function applyEmbedProgress(path: string, done: number, total: number) {
+    const id = currentRow[path];
+    if (!id) {
+      const embed: EmbedAnim = { shownDone: 0, targetDone: done, total };
+      currentRow[path] = pushFeed(path, `embedding 0/${total} (0%)`, embed);
+      scheduleEmbedRaf();
+      return;
+    }
+    const row = ingestFeed.find((r) => r.id === id);
+    const prev = row?.embed;
+    const shownDone = prev?.shownDone ?? 0;
+    const embed: EmbedAnim = { shownDone, targetDone: done, total };
+    const showPct = total ? Math.floor((shownDone / total) * 100) : 0;
+    updateFeed(id, {
+      status: `embedding ${shownDone}/${total} (${showPct}%)`,
+      embed,
+    });
+    scheduleEmbedRaf();
   }
 
   /** Rewrite the rolling line for `path`, or start a new one if none is open. */
   function logLine(path: string, status: string) {
     const id = currentRow[path];
-    if (id) updateFeed(id, { status });
+    const clearEmbed = !/^embedding\b/.test(status);
+    if (id) updateFeed(id, { status, ...(clearEmbed ? { embed: null } : {}) });
     else currentRow[path] = pushFeed(path, status);
   }
 
@@ -252,13 +329,84 @@
     delete currentRow[path];
   }
 
+  /** Drop the in-progress `[i/n] parsing…` row so we don't stack one line per file. */
+  function stripRollingLineForPath(path: string | undefined) {
+    if (!path) return;
+    const id = currentRow[path];
+    if (!id) return;
+    ingestFeed = ingestFeed.filter((row) => row.id !== id);
+    delete currentRow[path];
+    scheduleScroll();
+  }
+
+  function rollupReasonKey(reason: string): string {
+    const d = /^disabled:\s*'([^']+)'/i.exec(reason);
+    if (d) return `disabled:${d[1]!.toLowerCase()}`;
+    return reason.trim();
+  }
+
+  /** Short headline for the rollup row (same reason → one updating line). */
+  function rollupHeadline(reason: string): string {
+    const d = /^disabled:\s*'([^']+)'/i.exec(reason);
+    if (d) {
+      const k = d[1]!.toLowerCase();
+      const byKind: Record<string, string> = {
+        image: "Skipping images (PNG, JPG, …)",
+        audio: "Skipping audio",
+        video: "Skipping video",
+        pdf: "Skipping PDFs",
+        docx: "Skipping Word docs",
+        code: "Skipping code files",
+        html: "Skipping HTML",
+        text: "Skipping plain text",
+        "chatgpt-export": "Skipping chat exports",
+      };
+      const head = byKind[k] ?? `Skipping ‘${k}’ files`;
+      return `${head} — change in Settings`;
+    }
+    if (/no module named ['"]faster_whisper['"]/i.test(reason)) {
+      return "Skipping audio/video transcript (install faster-whisper in the sidecar venv)";
+    }
+    if (/no module named ['"]docx['"]/i.test(reason)) {
+      return "Skipping Word docs (pip install python-docx — then restart sidecar)";
+    }
+    const one = reason.replace(/^parse-error:\s*/i, "").trim();
+    const short = one.length > 80 ? `${one.slice(0, 77)}…` : one;
+    return `Skipping: ${short}`;
+  }
+
+  function handleIngestSkipped(msg: {
+    active?: Active;
+    result?: { path?: string; reason?: string; index?: number; total?: number };
+  }) {
+    const r = msg.result ?? {};
+    const path = r.path as string | undefined;
+    const reason = (r.reason ?? "").trim();
+    stripRollingLineForPath(path);
+
+    const act = msg.active;
+    const done = act?.done ?? (r.index as number | undefined) ?? 0;
+    const total = act?.total ?? (r.total as number | undefined) ?? "?";
+    const frac = `${done}/${total}`;
+    const key = rollupReasonKey(reason);
+    const headline = rollupHeadline(reason);
+    const status = `${headline} · ${frac}`;
+
+    if (skipRollup && skipRollup.key === key) {
+      updateFeed(skipRollup.feedId, { path: "⊘ batch", status });
+    } else {
+      skipRollup = { key, feedId: pushFeed("⊘ batch", status) };
+    }
+  }
+
   let scrollPending = false;
   function scheduleScroll() {
     if (scrollPending) return;
     scrollPending = true;
     requestAnimationFrame(() => {
       scrollPending = false;
-      if (termEl) termEl.scrollTop = termEl.scrollHeight;
+      if (!termEl) return;
+      termEl.scrollTo({ top: termEl.scrollHeight, behavior: "smooth" });
     });
   }
 
@@ -282,6 +430,8 @@
       if (name === "watcher")  return { label: "WCH", cls: "sys" };
       return { label: "···", cls: "dflt" };
     }
+    if (name === "⊘ batch") return { label: "SKIP", cls: "warn" };
+    if (p.includes("✨")) return { label: "✨", cls: "delight" };
     // Folder drop results come back as the folder path.
     if (/folder\s+done/i.test(status) || !/\.[a-z0-9]+$/i.test(name)) {
       return { label: "DIR", cls: "dir" };
@@ -346,6 +496,7 @@
       case "err":      return "✗";
       case "warn":     return "!";
       case "saved":    return "=";
+      case "delight":  return "✨";
       case "progress": return SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length];
       default:         return "·";
     }
@@ -433,6 +584,7 @@
           if (status) status = { ...status, counts: msg.counts };
           if (msg.active) active = msg.active;
         } else if (msg.type === "ingest_started") {
+          skipRollup = null;
           if (msg.active) active = msg.active;
           if (msg.path) logLine(msg.path, `[${msg.active?.done ?? 0}/${msg.active?.total ?? "?"}] parsing…`);
         } else if (msg.type === "ingest_progress") {
@@ -462,24 +614,26 @@
           } else if (stage === "parsed") {
             logLine(msg.path, `parsed · ${msg.chunks ?? 0} chunks`);
           } else if (stage === "embed") {
-            const pct = total ? Math.floor((done / total) * 100) : 0;
-            logLine(msg.path, `embedding ${done}/${total} (${pct}%)`);
+            applyEmbedProgress(msg.path, done, total);
           }
         } else if (msg.type === "source_updated") {
           if (msg.active) active = msg.active;
           const r = msg.result as { path?: string; chunk_count?: number };
           if (r.path) endLine(r.path, `ingested · ${r.chunk_count ?? 0} chunks`);
           await refreshSources();
+        } else if (msg.type === "ingest_delight") {
+          const line = msg.line.trim();
+          if (line) pushFeed("✨ Minion", line);
         } else if (msg.type === "ingest_skipped") {
           if (msg.active) active = msg.active;
-          const r = msg.result as { path?: string; reason?: string };
-          if (r.path) endLine(r.path, `skipped (${r.reason ?? ""})`);
+          handleIngestSkipped(msg);
         } else if (msg.type === "ingest_failed") {
           if (msg.active) active = msg.active;
           endLine(msg.path, "failed");
         } else if (msg.type === "source_removed") {
           await refreshSources();
         } else if (msg.type === "tree_done") {
+          skipRollup = null;
           active = { root: null, total: 0, done: 0, added: 0, skipped: 0 };
           pushFeed(msg.root, `done · +${msg.added} ${msg.skipped ? `· ⊘${msg.skipped}` : ""}`);
           await refreshSources();
@@ -529,6 +683,7 @@
 
     return () => {
       clearInterval(spin);
+      cancelEmbedRaf();
       unlistens.forEach((fn) => fn());
     };
   });
@@ -662,7 +817,7 @@
         <li class="term-empty">$ waiting for input…</li>
       {/if}
       {#each ingestFeed as item (item.id)}
-        {@const cls = statusClass(item.status)}
+        {@const cls = statusClass(item.status, item.path)}
         {@const kind = fileKind(item.path, item.status)}
         <li
           title={item.path + "\n" + item.status}
@@ -1306,6 +1461,7 @@
     margin: 0;
     padding: 10px 14px;
     overflow-y: auto;
+    scroll-behavior: smooth;
     font-family: var(--mono-font);
     font-size: 12px;
     line-height: 1.55;
@@ -1326,6 +1482,8 @@
   .term-log li.warn  .term-glyph { color: var(--warn); }
   .term-log li.ok    .msg,
   .term-log li.ok    .term-glyph { color: var(--success); }
+  .term-log li.delight .msg,
+  .term-log li.delight .term-glyph { color: var(--accent); }
   .term-log li.saved .msg,
   .term-log li.saved .term-glyph { color: var(--saved); }
   .term-log li.progress .msg,
@@ -1421,6 +1579,7 @@
   .kind-sys  { color: #64748b; }
   .kind-vis  { color: #a21caf; }
   .kind-dflt { color: var(--muted); }
+  .kind-delight { color: var(--accent); text-shadow: 0 0 12px color-mix(in srgb, var(--accent) 35%, transparent); }
 
   .fn { color: var(--ink); font-weight: 500; margin-right: 10px; }
   .msg { color: var(--muted); }
