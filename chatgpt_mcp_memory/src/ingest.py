@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict
 
 import numpy as np
 
-from parsers import ParseResult, UnsupportedFile, is_disabled_kind, kind_for, parse_file
+from parsers import ParseResult, ParsedChunk, UnsupportedFile, is_disabled_kind, kind_for, parse_file
 from store import sha256_of_file, upsert_source
 import telemetry
 
@@ -67,6 +67,27 @@ ProgressFn = Callable[[str, Dict[str, Any]], None]
 
 def _noop(_stage: str, _info: Dict[str, Any]) -> None:
     pass
+
+
+def _inject_file_context(path: Path, chunks: List[ParsedChunk]) -> None:
+    """Prefix basename (and spaced stem) onto chunk text.
+
+    FTS5 and embeddings only see chunk body — adding the filename makes queries
+    like roster / U9 / deck match CSVs and other files whose signal is largely
+    in the name.
+    """
+    if not chunks:
+        return
+    base = path.name
+    stem = Path(base).stem
+    spaced = stem.replace("_", " ").replace("-", " ").strip()
+    header = f"File: {base}\n"
+    # Underscores often fuse into one FTS token; underscore→space exposes words.
+    if spaced:
+        header += f"Keywords: {spaced}\n"
+    header += "\n"
+    for ch in chunks:
+        ch.text = header + ch.text
 
 
 # Archive formats we unpack in-place. The contents are ingested individually
@@ -342,6 +363,8 @@ def _ingest_file_inner(
             reason="file parsed but produced no text (empty or unsupported content)",
         )
 
+    _inject_file_context(path, result.chunks)
+
     on_progress("parsed", {"chunks": len(result.chunks), "kind": result.kind, "parser": result.parser})
 
     name = model_name or os.environ.get("MINION_EMBED_MODEL", DEFAULT_MODEL)
@@ -427,6 +450,8 @@ def _ingest_chatgpt_export_dir(
             spath, None, result.kind or "chatgpt-export", result.parser or "chatgpt-export", 0, True,
             reason="export parsed but produced no user-message chunks",
         )
+
+    _inject_file_context(path, result.chunks)
 
     on_progress("parsed", {"chunks": len(result.chunks), "kind": result.kind, "parser": result.parser})
 

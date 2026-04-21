@@ -875,7 +875,9 @@ TOOLS: List[Dict[str, Any]] = [
             "opens the file on macOS. Keep it conversational: one link per "
             "answer on the primary source; don't quote raw paths or IDs.\n\n"
             "Modes: `relevance` (semantic, default) · `oldest`/`newest` "
-            "(chronological, query optional) · `keyword` (FTS5 exact-phrase). "
+            "(chronological, query optional) · `keyword` (FTS5 BM25 over chunk "
+            "text; whitespace-separated tokens are OR'd and ranked — good for "
+            "filenames plus natural words). "
             "Bound time with `before`/`after`. Expand a hit with `get_chunk`; "
             "list chats with `browse_conversations`; fetch a full thread with "
             "`conversation_chunks`. When in doubt, search first."
@@ -894,7 +896,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": (
                         "relevance = semantic embedding search; "
                         "oldest/newest = chronological by chunk create_time (no embedding); "
-                        "keyword = FTS5 exact-phrase / proper-noun search."
+                        "keyword = FTS5 BM25 token search (multiple words OR'd together)."
                     ),
                 },
                 "top_k": {"type": "integer", "minimum": 1, "maximum": TOP_K_CAP, "default": DEFAULT_TOP_K},

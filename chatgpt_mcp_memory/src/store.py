@@ -755,14 +755,20 @@ def _fts5_sanitize(query: str) -> str:
     """Make a user-typed string safe for FTS5 MATCH.
 
     FTS5 treats unquoted punctuation (colons, parens, quotes, dashes) as
-    operators. We wrap each whitespace-separated token in double quotes,
-    escaping embedded double quotes, which forces phrase/token matching
-    without surprising operator semantics.
+    operators. We wrap each whitespace-separated token in double quotes.
+
+    Multiple tokens are joined with **OR**: natural-language queries like
+    ``U9 soccer roster`` almost never appear verbatim in one chunk; AND would
+    return empty rows even when filename prefixes match some tokens.
+    BM25 ranking still floats the best matches up.
     """
     tokens = [t for t in query.split() if t.strip()]
     if not tokens:
         return '""'
-    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    if len(quoted) == 1:
+        return quoted[0]
+    return "(" + " OR ".join(quoted) + ")"
 
 
 def list_conversations(
