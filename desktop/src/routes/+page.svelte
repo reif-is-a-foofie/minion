@@ -40,6 +40,7 @@
   let connectMsg = $state<string>("");
   let showContents = $state(false);
   let showSettings = $state(false);
+  let settingsError = $state<string | null>(null);
   let allKinds = $state<string[]>([]);
   let disabledKinds = $state<Set<string>>(new Set());
   let settingsLoaded = $state(false);
@@ -110,13 +111,16 @@
   };
 
   async function loadSettings() {
+    settingsError = null;
     try {
       const res = await fetchSettings();
       allKinds = res.all_kinds;
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
       settingsLoaded = true;
     } catch (e) {
-      pushFeed("settings", `load failed: ${(e as Error).message}`);
+      const msg = (e as Error).message;
+      settingsError = msg;
+      pushFeed("settings", `load failed: ${msg}`);
     }
   }
 
@@ -553,7 +557,7 @@
 <main class="app" class:dragging>
   <header>
     <div class="brand">
-      <div class="dot"></div>
+      <img src="/minion.png" alt="" class="brand-icon" />
       <h1>Minion</h1>
     </div>
     <div class="counts">
@@ -730,7 +734,12 @@
           File types
           <span class="section-hint">{savingSettings ? "saving…" : "toggle what Minion ingests"}</span>
         </div>
-        {#if !settingsLoaded}
+        {#if !settingsLoaded && settingsError}
+          <div class="empty">
+            Couldn't reach the sidecar: {settingsError}.
+            <button class="link" onclick={loadSettings}>Retry</button>
+          </div>
+        {:else if !settingsLoaded}
           <div class="empty">Loading…</div>
         {:else}
           <ul class="kind-list">
