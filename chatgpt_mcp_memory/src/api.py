@@ -41,7 +41,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from ingest import ingest_file, _looks_like_chatgpt_export
-from parsers import supported_extensions
+from parsers import ALL_KINDS, supported_extensions
+from settings import apply_settings, load_settings, save_settings
+import telemetry
 from store import (
     DB_FILENAME,
     connect,
@@ -289,6 +291,14 @@ async def _lifespan(app: FastAPI):
     State.loop = asyncio.get_running_loop()
     State.subscribers_lock = asyncio.Lock()
     _resolve_paths()
+    telemetry.configure(State.data_dir)
+    # Load & apply user preferences before the watcher starts scanning the
+    # inbox — otherwise a reconcile pass could ingest kinds the user has
+    # already turned off.
+    try:
+        apply_settings(load_settings(State.data_dir))
+    except Exception:
+        log.exception("failed to load settings")
     _start_watcher()
     # Nudge Claude Desktop to re-read our tool descriptions + retrieval policy
     # whenever the MCP-relevant sources have changed since last launch. No-op
@@ -361,6 +371,26 @@ class DeleteBody(BaseModel):
 class ConnectBody(BaseModel):
     server_name: str = "minion"
     config_path: Optional[str] = None
+
+
+class SettingsBody(BaseModel):
+    disabled_kinds: Optional[List[str]] = None
+
+
+@app.get("/settings")
+def settings_endpoint() -> Dict[str, Any]:
+    data = load_settings(State.data_dir)
+    return {"settings": data, "all_kinds": list(ALL_KINDS)}
+
+
+@app.put("/settings")
+def update_settings(body: SettingsBody) -> Dict[str, Any]:
+    current = load_settings(State.data_dir)
+    if body.disabled_kinds is not None:
+        current["disabled_kinds"] = body.disabled_kinds
+    saved = save_settings(State.data_dir, current)
+    apply_settings(saved)
+    return {"settings": saved, "all_kinds": list(ALL_KINDS)}
 
 
 @app.get("/status")

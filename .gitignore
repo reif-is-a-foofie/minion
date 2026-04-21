@@ -36,3 +36,5 @@ desktop/.svelte-kit/
 desktop/build/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+# sync_sidecar.sh output; regenerated on every build
+desktop/src-tauri/resources/sidecar/

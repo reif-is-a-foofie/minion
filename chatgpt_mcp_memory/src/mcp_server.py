@@ -28,6 +28,7 @@ from store import (
     connect,
     count_chunks,
     count_sources,
+    fts_available,
     get_chunk as store_get_chunk,
     get_conversation_chunks as store_get_conversation_chunks,
     get_meta,
@@ -37,6 +38,7 @@ from store import (
     list_sources as store_list_sources,
     search as store_search,
 )
+import telemetry
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
     USER_EDITS_SENTINEL,
@@ -268,6 +270,7 @@ def _get_conn() -> sqlite3.Connection:
         data_dir = _data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         _maybe_auto_migrate(data_dir)
+        telemetry.configure(data_dir)
         db_path = data_dir / DB_FILENAME
         _CONN = connect(db_path)
         _maybe_start_watcher(db_path)
@@ -340,6 +343,74 @@ def _cap_text(text: str, max_chars: int) -> str:
 
 _VALID_MODES = ("relevance", "oldest", "newest", "keyword")
 
+# RRF fusion constant. 60 is the canonical value from Cormack et al. 2009;
+# tuning it above ~30 makes the fused ranks robust to score-scale differences
+# between semantic cosine and FTS5 BM25.
+_RRF_K = 60
+
+
+def _content_fingerprint(text: str) -> str:
+    """Cheap hash of the first ~400 meaningful chars.
+
+    Two chunks with the same fingerprint are near-duplicates (same OCR pass,
+    same conversation re-ingested from a second ChatGPT export, etc.). We
+    drop later occurrences from results so retrieval slots aren't burned on
+    redundant text.
+    """
+    import hashlib
+    # Normalize whitespace + case so "  foo\n BAR " == "foo bar".
+    norm = " ".join((text or "").split()).lower()[:400]
+    return hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()
+
+
+def _rrf_fuse(
+    relevance_hits: List[Any],
+    keyword_hits: List[Any],
+    *,
+    k: int = _RRF_K,
+    semantic_weight: float = 1.5,
+) -> List[Any]:
+    """Weighted Reciprocal Rank Fusion of two hit lists by chunk_id.
+
+    score(c) = w_sem / (k + rank_sem(c)) + 1 / (k + rank_kw(c))
+
+    Semantic gets a 1.5x weight because FTS5 with implicit-AND across
+    common tokens surfaces noise (e.g. a query with "location" will match
+    unrelated chunks that happen to contain "location"). Weighting
+    semantic higher means keyword acts as a nudge for rare proper nouns
+    without hijacking queries where semantic already nailed it.
+
+    Only fuse ranks; preserve each hit's original score on the returned
+    object so the caller can display a faithful cosine (or BM25-derived)
+    number rather than an opaque fused metric.
+    """
+    scores: Dict[str, float] = {}
+    kept: Dict[str, Any] = {}
+    for rank, h in enumerate(relevance_hits, start=1):
+        cid = h.chunk_id
+        scores[cid] = scores.get(cid, 0.0) + semantic_weight / (k + rank)
+        kept[cid] = h  # relevance copy wins (carries cosine score)
+    for rank, h in enumerate(keyword_hits, start=1):
+        cid = h.chunk_id
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        kept.setdefault(cid, h)
+    fused = sorted(kept.values(), key=lambda h: scores[h.chunk_id], reverse=True)
+    return fused
+
+
+def _file_url(path: Optional[str]) -> Optional[str]:
+    """Turn a local absolute path into a `file://` URI suitable for a
+    markdown link. Claude Desktop on macOS renders these as clickable;
+    cmd-click opens the file in its default app (Finder for folders,
+    Preview for PDFs, etc.).
+    """
+    if not path:
+        return None
+    # Handle ChatGPT export directories and regular files the same way.
+    from urllib.parse import quote
+    # Preserve `/` so the URL stays readable; encode everything else.
+    return "file://" + quote(path, safe="/")
+
 
 def _hit_to_result(hit: Any, max_chars: int) -> Dict[str, Any]:
     meta = hit.meta or {}
@@ -349,6 +420,7 @@ def _hit_to_result(hit: Any, max_chars: int) -> Dict[str, Any]:
         "role": hit.role,
         "source_id": hit.source_id,
         "path": hit.path,
+        "file_url": _file_url(hit.path),
         "kind": hit.kind,
         "mtime": hit.mtime,
         "conversation_id": meta.get("conversation_id"),
@@ -417,8 +489,10 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
     else:  # relevance
         qvec = _embed_query(query)
-        internal_k = top_k * 3 if dedupe_by_source else top_k
-        hits = store_search(
+        # Fetch 3x the user's top_k as candidates: gives dedup + fusion room
+        # to promote under-ranked scanned docs without starving the final list.
+        internal_k = max(top_k * 3, top_k + 8)
+        relevance_hits = store_search(
             conn,
             qvec,
             top_k=internal_k,
@@ -427,16 +501,80 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
             since=since_f,
             role=role,
         )
+        # Hybrid rerank: fuse semantic cosine with FTS5 BM25 via Reciprocal
+        # Rank Fusion. Fixes the classic failure mode where a short chat turn
+        # echoing the query ("ok and how does this fit the patriarchal
+        # blessing") outranks the OCR'd source document. FTS5 rewards exact
+        # phrase hits that embeddings underweight. Skip fusion when FTS is
+        # unavailable (SQLite build w/o FTS5) or the query is empty.
+        hits = relevance_hits
+        rerank_used = "none"
+        if query and fts_available(conn):
+            try:
+                keyword_hits = store_keyword_search(
+                    conn,
+                    query,
+                    top_k=internal_k,
+                    role=role,
+                    kind=kind,
+                    path_glob=path_glob,
+                    before=before_f,
+                    after=after_f,
+                )
+                if keyword_hits:
+                    hits = _rrf_fuse(relevance_hits, keyword_hits)
+                    rerank_used = "rrf"
+            except Exception:
+                log.exception("RRF fusion failed; falling back to relevance-only")
+        # Bookkeeping for telemetry below.
+        _SESSION_STATE["_last_rerank"] = rerank_used
+        _SESSION_STATE["_last_candidates"] = len(relevance_hits)
 
     results: List[Dict[str, Any]] = []
     seen_sources: set[str] = set()
+    seen_content: set[str] = set()
+    content_dropped = 0
     for h in hits:
         if dedupe_by_source and h.source_id in seen_sources:
             continue
+        # Content-dedup catches near-identical chunks across different
+        # source_ids — e.g. two copies of the same ChatGPT export. This is
+        # separate from source-dedup because same-source duplicates are
+        # already handled above; this catches cross-source duplication.
+        fp = _content_fingerprint(h.text)
+        if fp in seen_content:
+            content_dropped += 1
+            continue
         seen_sources.add(h.source_id)
+        seen_content.add(fp)
         results.append(_hit_to_result(h, max_chars))
         if len(results) >= top_k:
             break
+
+    # Telemetry: one line per search, so future improvements (retrieval bugs,
+    # chronic weak hits, queries that always fall back to keyword) can be
+    # spotted by tailing the JSONL. Never blocks or raises.
+    try:
+        top = results[0] if results else {}
+        telemetry.log_event(
+            "search",
+            mode=mode,
+            query=query or None,
+            top_k=top_k,
+            returned=len(results),
+            top_score=top.get("score"),
+            top_path=top.get("path"),
+            top_kind=top.get("kind"),
+            rerank=_SESSION_STATE.pop("_last_rerank", "none"),
+            candidates=_SESSION_STATE.pop("_last_candidates", None),
+            content_dropped=content_dropped,
+            hit_kinds=[r.get("kind") for r in results],
+            kind_filter=kind,
+            path_glob=path_glob,
+            role=role,
+        )
+    except Exception:
+        pass
 
     return results
 
@@ -729,6 +867,13 @@ TOOLS: List[Dict[str, Any]] = [
             "list chats with `browse_conversations`. For time-scoped "
             "questions (first, earliest, latest, before X, since Y), use "
             "`oldest` or `newest` mode.\n\n"
+            "When you answer from a Minion hit, name the source briefly so "
+            "the user can verify — the document title, file name, or "
+            "conversation title from the hit. Link to the source using the "
+            "`file_url` field from the result as a markdown link: e.g. "
+            "`[your patriarchal blessing certificate](file:///...)`. Cmd-click "
+            "opens the file on macOS. Keep it conversational: one link per "
+            "answer on the primary source; don't quote raw paths or IDs.\n\n"
             "Modes: `relevance` (semantic, default) · `oldest`/`newest` "
             "(chronological, query optional) · `keyword` (FTS5 exact-phrase). "
             "Bound time with `before`/`after`. Expand a hit with `get_chunk`; "

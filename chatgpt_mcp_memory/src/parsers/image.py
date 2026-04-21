@@ -102,6 +102,135 @@ def _ocr_rapidocr(path: Path) -> Tuple[str, Optional[str]]:
     return "\n".join(s for s in lines if s and s.strip()), None
 
 
+def _rational_to_float(r) -> Optional[float]:
+    try:
+        if isinstance(r, tuple) and len(r) == 2:
+            num, den = r
+            return float(num) / float(den) if den else None
+        return float(r)
+    except Exception:
+        return None
+
+
+def _gps_to_decimal(dms, ref: Optional[str]) -> Optional[float]:
+    try:
+        d = _rational_to_float(dms[0]) or 0.0
+        m = _rational_to_float(dms[1]) or 0.0
+        s = _rational_to_float(dms[2]) or 0.0
+        val = d + m / 60.0 + s / 3600.0
+        if ref and ref.upper() in ("S", "W"):
+            val = -val
+        return round(val, 6)
+    except Exception:
+        return None
+
+
+def _extract_image_metadata(path: Path) -> dict:
+    """Cheap, defensive metadata pull for embed + source_meta.
+
+    Pulls what PIL gives us for free: dimensions, format, EXIF datetime,
+    camera/lens, software, orientation, GPS. Plus the filename stem, which
+    is often the only human-assigned label an image carries.
+    """
+    meta: dict = {}
+    stem = path.stem.strip()
+    if stem:
+        meta["filename"] = stem
+    try:
+        from PIL import Image  # type: ignore
+        from PIL.ExifTags import TAGS, GPSTAGS  # type: ignore
+    except Exception:
+        return meta
+    try:
+        with Image.open(path) as im:
+            if im.width and im.height:
+                meta["width"] = im.width
+                meta["height"] = im.height
+                meta["megapixels"] = round((im.width * im.height) / 1_000_000, 2)
+            if im.format:
+                meta["format"] = im.format
+            if im.mode:
+                meta["mode"] = im.mode
+            exif_raw = None
+            try:
+                exif_raw = im.getexif()
+            except Exception:
+                exif_raw = None
+            if exif_raw:
+                exif = {TAGS.get(k, str(k)): v for k, v in exif_raw.items()}
+                for key, target in (
+                    ("DateTimeOriginal", "taken_at"),
+                    ("DateTime", "taken_at"),
+                    ("Make", "camera_make"),
+                    ("Model", "camera_model"),
+                    ("LensModel", "lens"),
+                    ("Software", "software"),
+                    ("ImageDescription", "description"),
+                    ("Artist", "artist"),
+                ):
+                    val = exif.get(key)
+                    if val and target not in meta:
+                        s = str(val).strip().strip("\x00")
+                        if s:
+                            meta[target] = s
+                orient = exif.get("Orientation")
+                if isinstance(orient, int) and orient != 1:
+                    meta["orientation"] = orient
+                gps_info = exif.get("GPSInfo")
+                if isinstance(gps_info, dict):
+                    gps = {GPSTAGS.get(k, str(k)): v for k, v in gps_info.items()}
+                    lat = _gps_to_decimal(
+                        gps.get("GPSLatitude"), gps.get("GPSLatitudeRef")
+                    )
+                    lon = _gps_to_decimal(
+                        gps.get("GPSLongitude"), gps.get("GPSLongitudeRef")
+                    )
+                    if lat is not None and lon is not None:
+                        meta["gps_lat"] = lat
+                        meta["gps_lon"] = lon
+                    alt = gps.get("GPSAltitude")
+                    alt_f = _rational_to_float(alt) if alt is not None else None
+                    if alt_f is not None:
+                        meta["gps_alt_m"] = round(alt_f, 1)
+    except Exception:
+        pass
+    return meta
+
+
+def _meta_text(meta: dict) -> str:
+    """Render metadata as a short human-readable block for embedding."""
+    order = (
+        "filename",
+        "taken_at",
+        "camera_make",
+        "camera_model",
+        "lens",
+        "software",
+        "description",
+        "artist",
+        "format",
+        "width",
+        "height",
+        "megapixels",
+        "gps_lat",
+        "gps_lon",
+        "gps_alt_m",
+    )
+    lines = []
+    for k in order:
+        v = meta.get(k)
+        if v is None or v == "":
+            continue
+        if k == "width" and "height" in meta:
+            lines.append(f"dimensions: {meta['width']}x{meta['height']}")
+            continue
+        if k == "height":
+            continue
+        label = k.replace("_", " ")
+        lines.append(f"{label}: {v}")
+    return "\n".join(lines)
+
+
 def _caption_ollama(path: Path, model: str) -> Tuple[Optional[str], Optional[str]]:
     """Return (caption, error). error=None on success (caption may still be empty).
 
@@ -146,6 +275,7 @@ def parse(path: Path) -> ParseResult:
     if bad:
         raise EmptyParse(bad)
 
+    img_meta = _extract_image_metadata(path)
     ocr_text, ocr_err = _ocr_rapidocr(path)
 
     vision_model = os.environ.get("MINION_VISION_MODEL", "").strip()
@@ -155,11 +285,18 @@ def parse(path: Path) -> ParseResult:
         caption, caption_err = _caption_ollama(path, vision_model)
 
     parts: List[str] = []
+    meta_block = _meta_text(img_meta)
+    if meta_block:
+        parts.append(f"[meta]\n{meta_block}")
     if caption:
         parts.append(f"[caption]\n{caption}")
     if ocr_text:
         parts.append(f"[ocr]\n{ocr_text}")
-    combined = "\n\n".join(parts)
+    # Require real content (caption or OCR) — metadata alone isn't enough
+    # to call a photo "ingested"; otherwise every undecoded snapshot slips
+    # past the deferred gate.
+    has_content = bool(caption) or bool(ocr_text)
+    combined = "\n\n".join(parts) if has_content else ""
 
     if not combined.strip():
         # Nothing to embed. The messages below are deliberately infrastructural
@@ -185,12 +322,14 @@ def parse(path: Path) -> ParseResult:
     parser_name = "rapidocr" if ocr_text else ""
     if caption:
         parser_name = f"{parser_name}+ollama" if parser_name else "ollama"
+    source_meta = {
+        "ocr": bool(ocr_text),
+        "caption_model": vision_model or None,
+    }
+    source_meta.update(img_meta)
     return ParseResult(
         chunks=chunks,
-        source_meta={
-            "ocr": bool(ocr_text),
-            "caption_model": vision_model or None,
-        },
+        source_meta=source_meta,
         kind="image",
         parser=parser_name or "image",
     )

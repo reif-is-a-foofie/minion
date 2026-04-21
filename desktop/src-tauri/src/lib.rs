@@ -2,22 +2,57 @@
 //
 // Responsibilities:
 // - Resolve (and create) the user's Minion data dir + inbox
-// - Spawn the Python API sidecar as a managed child process (dev: use repo venv;
-//   prod: use a bundled sidecar binary -- see scripts/build_sidecar.sh)
+// - Discover the Python sidecar source (bundled under `Resources/sidecar` in
+//   the shipped .app, or a dev checkout walking up from current_exe)
+// - First-launch bootstrap: find a system `python3 >= 3.10`, create a venv
+//   under `<data_dir>/venv`, pip install the bundled sidecar requirements.
+//   Streams `sidecar://status` events to the UI so the window isn't blank.
+// - Spawn the Python API sidecar as a managed child process, using the
+//   bootstrapped venv and the bundled source tree (no compile-time paths).
 // - Expose minimal Tauri commands the frontend uses:
-//     app_config, copy_into_inbox, reveal_in_finder
+//     app_config, copy_into_inbox, reveal_in_finder, restart_sidecar
 // Native OS file drops are delivered to the frontend by Tauri v2 as the
 // `tauri://drag-drop` event; the frontend forwards the paths to
 // `copy_into_inbox`.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
-use tauri::{Emitter, Manager, WindowEvent};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+
+// ---------------------------------------------------------------------------
+// Debug NDJSON instrumentation (active until post-release verification).
+// Writes one JSON line per significant event to the session logfile defined
+// by $MINION_DEBUG_LOG (set during `cargo tauri build` for this session).
+// Safe to leave in place — overhead is a single append() when the env var
+// is set, zero otherwise.
+// ---------------------------------------------------------------------------
+fn dbg(event: &str, data: serde_json::Value) {
+    let path = match std::env::var("MINION_DEBUG_LOG") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "sessionId": "d21adc",
+        "location": format!("lib.rs:{event}"),
+        "message": event,
+        "data": data,
+        "timestamp": ts,
+    });
+    if let Ok(line) = serde_json::to_string(&payload) {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
 
 // Folders that are almost never what the user meant to index. Skipped while
 // walking dropped directories. Keep small and conservative -- the Python
@@ -55,6 +90,11 @@ struct AppState {
     data_dir: PathBuf,
     inbox: PathBuf,
     api_port: u16,
+    /// Directory containing api.py (bundled resource in prod, dev checkout
+    /// otherwise). Set once by setup(); used by every sidecar respawn.
+    sidecar_src_dir: Mutex<Option<PathBuf>>,
+    /// Path to the venv Python that runs the sidecar. Set after bootstrap.
+    sidecar_python: Mutex<Option<PathBuf>>,
 }
 
 // moondream: 1.7GB vs llava's 4.5GB, purpose-built for image captioning,
@@ -88,34 +128,232 @@ fn resolve_inbox(data_dir: &Path) -> PathBuf {
 // Sidecar
 // ---------------------------------------------------------------------------
 
-fn find_dev_python_sidecar() -> Option<(PathBuf, Vec<String>)> {
-    // <repo>/desktop/src-tauri/  -> <repo>/chatgpt_mcp_memory/src/api.py
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo = manifest.parent()?.parent()?;
-    let api = repo.join("chatgpt_mcp_memory").join("src").join("api.py");
-    if !api.exists() {
-        return None;
+/// Locate the sidecar source directory containing `api.py`. Resolution order:
+///   1. $MINION_SIDECAR_DIR env override (user or test harness)
+///   2. Tauri bundled resource `<Resources>/sidecar/src/api.py` (shipped path)
+///   3. Dev fallback: walk up from current_exe looking for
+///      `chatgpt_mcp_memory/src/api.py`
+/// Returns the directory containing api.py (cwd for the sidecar process).
+fn resolve_sidecar_src_dir(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MINION_SIDECAR_DIR") {
+        let pb = PathBuf::from(p);
+        if pb.join("api.py").exists() {
+            dbg("sidecar_src_dir", serde_json::json!({"via": "env", "path": pb}));
+            return Some(pb);
+        }
     }
-    let venv = repo.join("chatgpt_mcp_memory").join(".venv").join("bin").join("python");
-    let python = if venv.exists() { venv } else { PathBuf::from("python3") };
-    Some((python, vec![api.to_string_lossy().into_owned()]))
+    if let Ok(res_dir) = app.path().resource_dir() {
+        let c1 = res_dir.join("sidecar").join("src");
+        if c1.join("api.py").exists() {
+            dbg("sidecar_src_dir", serde_json::json!({"via": "resource", "path": c1}));
+            return Some(c1);
+        }
+        let c2 = res_dir.join("_up_").join("sidecar").join("src");
+        if c2.join("api.py").exists() {
+            dbg("sidecar_src_dir", serde_json::json!({"via": "resource_up", "path": c2}));
+            return Some(c2);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent().map(Path::to_path_buf);
+        for _ in 0..8 {
+            let Some(c) = cur.as_ref() else { break };
+            let cand = c.join("chatgpt_mcp_memory").join("src");
+            if cand.join("api.py").exists() {
+                dbg("sidecar_src_dir", serde_json::json!({"via": "dev_walk", "path": cand}));
+                return Some(cand);
+            }
+            cur = c.parent().map(Path::to_path_buf);
+        }
+    }
+    dbg("sidecar_src_dir", serde_json::json!({"via": "none", "path": serde_json::Value::Null}));
+    None
+}
+
+/// Locate the requirements file bundled alongside the sidecar source. Looks
+/// in the same Resources tree as [`resolve_sidecar_src_dir`]; returns `None`
+/// in dev if not staged (caller falls back to the repo's requirements.txt).
+fn resolve_sidecar_requirements(app: &AppHandle, src_dir: &Path) -> Option<PathBuf> {
+    // Shipped layout: <Resources>/sidecar/requirements.txt (sibling of src/)
+    if let Some(parent) = src_dir.parent() {
+        let r = parent.join("requirements.txt");
+        if r.exists() {
+            return Some(r);
+        }
+    }
+    if let Ok(res_dir) = app.path().resource_dir() {
+        let r = res_dir.join("sidecar").join("requirements.txt");
+        if r.exists() {
+            return Some(r);
+        }
+    }
+    // Dev fallback: <repo>/chatgpt_mcp_memory/requirements.txt
+    if let Some(grand) = src_dir.parent().and_then(Path::parent) {
+        let r = grand.join("requirements.txt");
+        if r.exists() {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Find a usable system `python3 >= 3.10` on PATH. Returns an absolute path
+/// (so relaunches from a different cwd still work) and the version string.
+fn find_system_python() -> Option<(PathBuf, String)> {
+    for name in ["python3.12", "python3.11", "python3.10", "python3"] {
+        let out = match Command::new(name).arg("--version").output() {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let ver = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        let ver = ver.trim().to_string();
+        if let Some(rest) = ver.strip_prefix("Python 3.") {
+            if let Some(minor_str) = rest.split('.').next() {
+                if let Ok(minor) = minor_str.trim().parse::<u32>() {
+                    if minor >= 10 {
+                        let abs = Command::new("which")
+                            .arg(name)
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                if o.status.success() {
+                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| PathBuf::from(name));
+                        return Some((abs, ver));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Path to the venv's Python executable under `<data_dir>/venv`.
+fn venv_python(data_dir: &Path) -> PathBuf {
+    data_dir.join("venv").join("bin").join("python")
+}
+
+/// Create `<data_dir>/venv` and pip-install the sidecar requirements. Streams
+/// `sidecar://status` events so the UI can show "Setting up Minion…" on first
+/// launch. Idempotent: if the venv already has the sidecar imports working,
+/// returns immediately.
+fn bootstrap_venv(
+    app: &AppHandle,
+    data_dir: &Path,
+    requirements: &Path,
+) -> Result<PathBuf, String> {
+    let py = venv_python(data_dir);
+    // Already bootstrapped AND core deps importable? Fast-path return.
+    if py.exists() && venv_has_core(&py) {
+        dbg("bootstrap", serde_json::json!({"state": "cached", "python": py}));
+        let _ = app.emit("sidecar://status", serde_json::json!({"state": "ready"}));
+        return Ok(py);
+    }
+
+    let emit = |stage: &str, message: &str| {
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({"state": stage, "message": message}),
+        );
+    };
+
+    // Find a usable system Python. If none, raise a clear, actionable error
+    // that the UI can surface verbatim.
+    let (system_py, ver) = find_system_python().ok_or_else(|| {
+        let msg = "Python 3.10+ not found on PATH. Install from https://www.python.org/downloads/ and relaunch Minion.".to_string();
+        emit("error", &msg);
+        dbg("bootstrap", serde_json::json!({"state": "no_python"}));
+        msg
+    })?;
+    dbg("bootstrap", serde_json::json!({"system_python": system_py, "version": ver}));
+
+    if !py.exists() {
+        emit("bootstrapping", "Creating Python environment…");
+        let status = Command::new(&system_py)
+            .arg("-m")
+            .arg("venv")
+            .arg(data_dir.join("venv"))
+            .status()
+            .map_err(|e| format!("venv launch failed: {e}"))?;
+        if !status.success() {
+            let msg = format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
+            emit("error", &msg);
+            dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
+            return Err(msg);
+        }
+        // Upgrade pip quietly; old pip on fresh Pythons sometimes can't resolve.
+        let _ = Command::new(&py)
+            .args(["-m", "pip", "install", "--upgrade", "--quiet", "pip"])
+            .status();
+    }
+
+    emit(
+        "installing",
+        "Installing dependencies (first launch, ~2 min)…",
+    );
+    dbg("bootstrap", serde_json::json!({"state": "pip_start", "requirements": requirements}));
+    let status = Command::new(&py)
+        .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
+        .arg(requirements)
+        .status()
+        .map_err(|e| format!("pip launch failed: {e}"))?;
+    if !status.success() {
+        let msg = format!("pip install failed (exit {})", status.code().unwrap_or(-1));
+        emit("error", &msg);
+        dbg("bootstrap", serde_json::json!({"state": "pip_failed"}));
+        return Err(msg);
+    }
+    dbg("bootstrap", serde_json::json!({"state": "pip_done"}));
+
+    emit("ready", "Minion is ready.");
+    Ok(py)
+}
+
+/// Quick sanity check: does this venv already have our core deps imported?
+/// Avoids a ~2min pip re-run on every launch even though the venv exists.
+fn venv_has_core(py: &Path) -> bool {
+    Command::new(py)
+        .args(["-c", "import fastapi, uvicorn, fastembed, watchdog, numpy"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn spawn_sidecar(
+    python: &Path,
+    src_dir: &Path,
     data_dir: &Path,
     inbox: &Path,
     api_port: u16,
     vision_model: Option<&str>,
 ) -> Option<Child> {
-    let (python, mut args) = find_dev_python_sidecar()?;
-    args.push("--port".into());
-    args.push(api_port.to_string());
+    let api = src_dir.join("api.py");
+    if !api.exists() {
+        dbg("spawn_sidecar", serde_json::json!({"state": "missing_api", "src_dir": src_dir}));
+        return None;
+    }
 
     let mut cmd = Command::new(python);
-    cmd.args(&args)
+    // cwd = src_dir so `from ingest import ...` sibling imports resolve.
+    cmd.current_dir(src_dir)
+        .arg(api.file_name().unwrap_or_else(|| std::ffi::OsStr::new("api.py")))
+        .arg("--port")
+        .arg(api_port.to_string())
         .env("MINION_DATA_DIR", data_dir)
         .env("MINION_INBOX", inbox)
         .env("MINION_API_PORT", api_port.to_string())
+        .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(model) = vision_model {
@@ -123,9 +361,13 @@ fn spawn_sidecar(
     }
 
     match cmd.spawn() {
-        Ok(child) => Some(child),
+        Ok(child) => {
+            dbg("spawn_sidecar", serde_json::json!({"state": "ok", "pid": child.id(), "python": python, "src_dir": src_dir}));
+            Some(child)
+        }
         Err(e) => {
             eprintln!("[minion] failed to spawn sidecar: {e}");
+            dbg("spawn_sidecar", serde_json::json!({"state": "spawn_err", "error": e.to_string()}));
             None
         }
     }
@@ -390,7 +632,8 @@ fn copy_tree(src_dir: &Path, dest_root: &Path, stats: &mut CopyStats) -> Result<
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().into_owned();
-            if name_str.starts_with('.') {
+            // macOS system noise — never useful, always skip.
+            if name_str == ".DS_Store" {
                 stats.skipped_dotfiles += 1;
                 continue;
             }
@@ -400,8 +643,14 @@ fn copy_tree(src_dir: &Path, dest_root: &Path, stats: &mut CopyStats) -> Result<
                 Err(_) => continue,
             };
             if file_type.is_dir() {
-                if should_skip_dir(&name_str) {
+                // Skip explicit build/SCM dirs AND any hidden dir (tooling
+                // config like .vscode, .idea, .obsidian/cache). Dotfiles
+                // that are NOT dirs fall through so `.env`, `.eslintrc`,
+                // `.prettierrc`, etc. get indexed — previously they were
+                // silently dropped.
+                if should_skip_dir(&name_str) || name_str.starts_with('.') {
                     stats.skipped_dirs += 1;
+                    dbg("copy_tree_skip_dir", serde_json::json!({"name": name_str}));
                     continue;
                 }
                 let next_dest = dest.join(&name_str);
@@ -412,6 +661,10 @@ fn copy_tree(src_dir: &Path, dest_root: &Path, stats: &mut CopyStats) -> Result<
                 stack.push((src_path, next_dest));
             } else if file_type.is_file() {
                 let dest_file = dest.join(&name_str);
+                if name_str.starts_with('.') {
+                    // Track dotfiles kept for visibility in the drop report.
+                    dbg("copy_tree_keep_dotfile", serde_json::json!({"name": name_str}));
+                }
                 match fs::copy(&src_path, &dest_file) {
                     Ok(n) => {
                         stats.bytes += n;
@@ -518,7 +771,21 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
     // tries to bind. 200ms is enough in practice; we also retry-bind below.
     std::thread::sleep(std::time::Duration::from_millis(200));
     let current_model = state.vision_model.lock().ok().and_then(|g| g.clone());
+    let python = state
+        .sidecar_python
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .ok_or_else(|| "sidecar python not yet bootstrapped".to_string())?;
+    let src_dir = state
+        .sidecar_src_dir
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .ok_or_else(|| "sidecar source not located".to_string())?;
     let new_child = spawn_sidecar(
+        &python,
+        &src_dir,
         &state.data_dir,
         &state.inbox,
         state.api_port,
@@ -642,8 +909,27 @@ fn ensure_vision_model(
             let _ = child.wait();
         }
         thread::sleep(Duration::from_millis(200));
-        let new_child = spawn_sidecar(&state.data_dir, &state.inbox, state.api_port, Some(&model))
-            .ok_or_else(|| "failed to respawn sidecar".to_string())?;
+        let python = state
+            .sidecar_python
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| "sidecar python not yet bootstrapped".to_string())?;
+        let src_dir = state
+            .sidecar_src_dir
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| "sidecar source not located".to_string())?;
+        let new_child = spawn_sidecar(
+            &python,
+            &src_dir,
+            &state.data_dir,
+            &state.inbox,
+            state.api_port,
+            Some(&model),
+        )
+        .ok_or_else(|| "failed to respawn sidecar".to_string())?;
         *guard = Some(new_child);
     }
     if let Ok(mut vm) = state.vision_model.lock() {
@@ -718,22 +1004,108 @@ pub fn run() {
         }
     }
 
-    let child = spawn_sidecar(&data_dir, &inbox, api_port, vision_model.as_deref());
+    // Sidecar spawn moves into `setup` below because it needs the AppHandle
+    // to resolve the bundled resource dir. Store None for now; setup fills it.
     let state = AppState {
-        sidecar: Mutex::new(child),
+        sidecar: Mutex::new(None),
         ollama: Mutex::new(ollama_child),
         ollama_bin: ollama_bin.clone(),
-        vision_model: Mutex::new(vision_model),
+        vision_model: Mutex::new(vision_model.clone()),
         data_dir: data_dir.clone(),
         inbox: inbox.clone(),
         api_port,
+        sidecar_src_dir: Mutex::new(None),
+        sidecar_python: Mutex::new(None),
     };
 
+    let initial_vision_model = vision_model.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(move |app| {
+            // Bootstrap + spawn on a background thread so the window paints
+            // immediately. UI subscribes to `sidecar://status` for progress.
+            let handle = app.handle().clone();
+            let data_dir_bg = data_dir.clone();
+            let inbox_bg = inbox.clone();
+            let port_bg = api_port;
+            let vm_bg = initial_vision_model.clone();
+            thread::spawn(move || {
+                let state = match handle.try_state::<AppState>() {
+                    Some(s) => s,
+                    None => {
+                        dbg("setup", serde_json::json!({"state": "no_state"}));
+                        return;
+                    }
+                };
+                let _ = handle.emit(
+                    "sidecar://status",
+                    serde_json::json!({"state": "starting", "message": "Locating sidecar…"}),
+                );
+                let src_dir = match resolve_sidecar_src_dir(&handle) {
+                    Some(d) => d,
+                    None => {
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({
+                                "state": "error",
+                                "message": "Could not locate Minion sidecar. Reinstall the app.",
+                            }),
+                        );
+                        return;
+                    }
+                };
+                if let Ok(mut g) = state.sidecar_src_dir.lock() {
+                    *g = Some(src_dir.clone());
+                }
+
+                let requirements = match resolve_sidecar_requirements(&handle, &src_dir) {
+                    Some(r) => r,
+                    None => {
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({
+                                "state": "error",
+                                "message": "Bundled requirements.txt missing. Reinstall the app.",
+                            }),
+                        );
+                        return;
+                    }
+                };
+
+                let python = match bootstrap_venv(&handle, &data_dir_bg, &requirements) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": e}));
+                        return;
+                    }
+                };
+                if let Ok(mut g) = state.sidecar_python.lock() {
+                    *g = Some(python.clone());
+                }
+
+                let child =
+                    spawn_sidecar(&python, &src_dir, &data_dir_bg, &inbox_bg, port_bg, vm_bg.as_deref());
+                if let Some(c) = child {
+                    if let Ok(mut g) = state.sidecar.lock() {
+                        *g = Some(c);
+                    }
+                    let _ = handle.emit(
+                        "sidecar://status",
+                        serde_json::json!({"state": "ready"}),
+                    );
+                } else {
+                    let _ = handle.emit(
+                        "sidecar://status",
+                        serde_json::json!({
+                            "state": "error",
+                            "message": "Sidecar failed to start. Check logs or relaunch.",
+                        }),
+                    );
+                }
+            });
+
             // First-launch auto-pull: if ollama is present but the default
             // vision model isn't, grab it in the background. Progress streams
             // into the UI terminal via the `vision://progress` event so it
@@ -742,12 +1114,24 @@ pub fn run() {
                 let handle = app.handle().clone();
                 let model = target_model.clone();
                 thread::spawn(move || {
-                    // Route through ensure_vision_model so pull + sidecar
-                    // restart + env wiring all happen in one place.
                     let state = match handle.try_state::<AppState>() {
                         Some(s) => s,
                         None => return,
                     };
+                    // Wait for the initial sidecar bootstrap to finish so the
+                    // vision-model respawn has a python + src_dir to reuse.
+                    for _ in 0..600 {
+                        if state
+                            .sidecar_python
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .is_some()
+                        {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
                     let _ = emit_vision(&handle, "start", &format!("pulling {model}…"));
                     if let Err(e) = ensure_vision_model(handle.clone(), state, Some(model.clone())) {
                         let _ = emit_vision(&handle, "error", &format!("auto-enable failed: {e}"));

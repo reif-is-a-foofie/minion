@@ -3,6 +3,20 @@
 // actually bound to.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+export type SidecarStatus = {
+  state: "starting" | "bootstrapping" | "installing" | "ready" | "error";
+  message?: string;
+};
+
+/// Subscribe to `sidecar://status` events emitted by Rust during first-launch
+/// bootstrap (locating sidecar, creating venv, pip-installing). Returns an
+/// unsubscribe fn. Used to render a "Setting up Minion…" overlay.
+export async function onSidecarStatus(fn: (s: SidecarStatus) => void): Promise<() => void> {
+  const unlisten = await listen<SidecarStatus>("sidecar://status", (ev) => fn(ev.payload));
+  return unlisten;
+}
 
 export type AppConfig = {
   data_dir: string;
@@ -145,21 +159,45 @@ export async function deleteSource(body: { path?: string; source_id?: string }):
   });
 }
 
-export type ConnState = "connecting" | "open" | "closed";
+export type ConnState = "connecting" | "open" | "closed" | "unreachable";
 
+/// Connect to the sidecar's `/events` WebSocket with bounded retries.
+/// Backoff schedule: 1.5s, 3s, 6s, 12s, 20s (capped). After ~8 attempts
+/// without a single successful open, flip to "unreachable" so the UI can
+/// show an actionable error instead of silently reconnecting forever.
 export async function openEvents(
   onMessage: (e: EventMsg) => void,
   onStatus?: (s: ConnState) => void,
 ): Promise<() => void> {
   let closed = false;
   let ws: WebSocket | null = null;
+  let attempts = 0;
+  let everOpened = false;
+  const MAX_ATTEMPTS_BEFORE_UNREACHABLE = 8;
+  const backoff = (n: number) => Math.min(1500 * Math.pow(1.6, n), 20000);
 
   const connect = async () => {
     if (closed) return;
+    attempts += 1;
     onStatus?.("connecting");
-    const cfg = await getConfig();
-    ws = new WebSocket(`${cfg.api_base.replace("http", "ws")}/events`);
-    ws.onopen = () => onStatus?.("open");
+    try {
+      const cfg = await getConfig();
+      ws = new WebSocket(`${cfg.api_base.replace("http", "ws")}/events`);
+    } catch (err) {
+      // Tauri invoke can reject early if backend is still spinning up.
+      if (!everOpened && attempts >= MAX_ATTEMPTS_BEFORE_UNREACHABLE) {
+        onStatus?.("unreachable");
+      } else {
+        onStatus?.("closed");
+      }
+      setTimeout(connect, backoff(attempts));
+      return;
+    }
+    ws.onopen = () => {
+      everOpened = true;
+      attempts = 0;
+      onStatus?.("open");
+    };
     ws.onmessage = (ev) => {
       try {
         onMessage(JSON.parse(ev.data));
@@ -169,11 +207,20 @@ export async function openEvents(
     };
     ws.onclose = () => {
       if (closed) return;
-      onStatus?.("closed");
-      // Sidecar restart takes ~1-3s; retry with a short backoff.
-      setTimeout(connect, 1500);
+      if (!everOpened && attempts >= MAX_ATTEMPTS_BEFORE_UNREACHABLE) {
+        onStatus?.("unreachable");
+      } else {
+        onStatus?.("closed");
+      }
+      setTimeout(connect, backoff(attempts));
     };
-    ws.onerror = () => onStatus?.("closed");
+    ws.onerror = () => {
+      if (!everOpened && attempts >= MAX_ATTEMPTS_BEFORE_UNREACHABLE) {
+        onStatus?.("unreachable");
+      } else {
+        onStatus?.("closed");
+      }
+    };
   };
   await connect();
 
@@ -185,6 +232,26 @@ export async function openEvents(
 
 export async function restartSidecar(): Promise<{ pid: number; api_port: number }> {
   return (await invoke("restart_sidecar")) as { pid: number; api_port: number };
+}
+
+export type Settings = {
+  disabled_kinds: string[];
+};
+
+export type SettingsResponse = {
+  settings: Settings;
+  all_kinds: string[];
+};
+
+export async function fetchSettings(): Promise<SettingsResponse> {
+  return apiFetch<SettingsResponse>("/settings");
+}
+
+export async function updateSettings(body: Partial<Settings>): Promise<SettingsResponse> {
+  return apiFetch<SettingsResponse>("/settings", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
 }
 
 export type VisionState = "unavailable" | "off" | "pulling" | "ready";

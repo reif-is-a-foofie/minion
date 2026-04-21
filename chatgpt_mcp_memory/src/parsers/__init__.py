@@ -11,7 +11,7 @@ from __future__ import annotations
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -118,6 +118,45 @@ for _ext in _CODE_EXT:
 
 def supported_extensions() -> List[str]:
     return sorted(_EXT_REGISTRY.keys())
+
+
+# Canonical list of user-togglable kinds (surfaced in the UI settings pane).
+# Keep this exact — the frontend reads it verbatim.
+ALL_KINDS: Tuple[str, ...] = (
+    "text",
+    "html",
+    "pdf",
+    "docx",
+    "image",
+    "audio",
+    "video",
+    "code",
+    "chatgpt-export",
+)
+
+# Kinds the user has opted out of. Runtime only; persisted by settings.py.
+_DISABLED_KINDS: Set[str] = set()
+
+
+def disabled_kinds() -> Set[str]:
+    return set(_DISABLED_KINDS)
+
+
+def set_disabled_kinds(kinds: Iterable[str]) -> None:
+    _DISABLED_KINDS.clear()
+    _DISABLED_KINDS.update(k for k in kinds if k in ALL_KINDS)
+
+
+def kind_for(path: Path) -> Optional[str]:
+    """Return the canonical kind for `path` (or None if unsupported)."""
+    chosen = choose_parser(path)
+    return chosen[0] if chosen else None
+
+
+def is_disabled_kind(path: Path) -> bool:
+    """True if the user has turned this file's kind off in settings."""
+    k = kind_for(path)
+    return bool(k and k in _DISABLED_KINDS)
 
 
 def choose_parser(path: Path) -> Optional[Tuple[str, str, str]]:

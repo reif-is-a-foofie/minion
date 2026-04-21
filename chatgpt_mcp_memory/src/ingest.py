@@ -18,8 +18,9 @@ from typing import Any, Callable, Dict
 
 import numpy as np
 
-from parsers import ParseResult, UnsupportedFile, parse_file
+from parsers import ParseResult, UnsupportedFile, is_disabled_kind, kind_for, parse_file
 from store import sha256_of_file, upsert_source
+import telemetry
 
 
 def _chatgpt_export_manifest_paths(root: Path) -> List[Path]:
@@ -240,10 +241,44 @@ def ingest_file(
     force: bool = False,
     on_progress: ProgressFn = _noop,
 ) -> IngestResult:
+    """Public ingest entrypoint. Wraps the pipeline with telemetry.
+
+    Telemetry is recorded for every call (success, skip, error) so we have a
+    single source of truth for how each file was handled, regardless of
+    whether it was triggered by the watcher, the CLI, or `bin/minion add`.
     """
-    Parse + embed + upsert a single file. Skips unchanged files (same sha256)
-    unless force=True. Returns an IngestResult describing what happened.
-    """
+    result = _ingest_file_inner(
+        conn, path, model_name=model_name, force=force, on_progress=on_progress
+    )
+    try:
+        telemetry.log_event(
+            "ingest",
+            path=result.path,
+            file_kind=result.kind,
+            parser=result.parser,
+            chunks=result.chunk_count,
+            skipped=result.skipped,
+            reason=result.reason,
+            result=(
+                "ingested" if not result.skipped
+                else (result.reason.split(":", 1)[0] if result.reason else "skipped")
+            ),
+            source_id=result.source_id,
+        )
+    except Exception:
+        pass
+    return result
+
+
+def _ingest_file_inner(
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    model_name: Optional[str] = None,
+    force: bool = False,
+    on_progress: ProgressFn = _noop,
+) -> IngestResult:
+    """Parse + embed + upsert. Skips unchanged files (same sha256) unless force=True."""
     path = Path(path).expanduser().resolve()
     spath = str(path)
     if not path.exists():
@@ -265,6 +300,15 @@ def ingest_file(
     unpacked = _maybe_unpack_archive(path, on_progress=on_progress)
     if unpacked is not None:
         return unpacked
+
+    # Respect user's file-type preferences (settings.json). Skip cleanly so
+    # the UI logs it as a deliberate opt-out, not a parser failure.
+    if is_disabled_kind(path):
+        k = kind_for(path) or path.suffix.lstrip(".") or "?"
+        return IngestResult(
+            spath, None, k, "disabled", 0, True,
+            reason=f"disabled: '{k}' parsing turned off in settings",
+        )
 
     digest = sha256_of_file(path)
     if not force:

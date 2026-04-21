@@ -6,17 +6,21 @@
     connectClaudeDesktop,
     copyIntoInbox,
     deleteSource,
+    fetchSettings,
     fetchSources,
     fetchStatus,
     getConfig,
+    onSidecarStatus,
     openEvents,
     restartSidecar,
     revealInFinder,
     search,
+    updateSettings,
     type Active,
     type AppConfig,
     type ConnState,
     type SearchHit,
+    type SidecarStatus,
     type Source,
     type Status,
   } from "$lib/api";
@@ -35,6 +39,11 @@
   let connecting = $state(false);
   let connectMsg = $state<string>("");
   let showContents = $state(false);
+  let showSettings = $state(false);
+  let allKinds = $state<string[]>([]);
+  let disabledKinds = $state<Set<string>>(new Set());
+  let settingsLoaded = $state(false);
+  let savingSettings = $state(false);
   let termEl: HTMLUListElement | undefined = $state();
   // Rolling per-file line id, so subsequent progress events for the same
   // path rewrite a single terminal line instead of stacking.
@@ -42,6 +51,10 @@
   let conn = $state<ConnState>("connecting");
   let lastHeartbeat = $state<number>(0);
   let restarting = $state(false);
+  // First-launch sidecar bootstrap status. When `state === "ready"` the
+  // overlay hides; any other non-null state shows a full-screen progress
+  // card so the window isn't a silent void while pip runs for ~2 minutes.
+  let sidecar = $state<SidecarStatus | null>(null);
 
 
   // If we stop hearing from the sidecar for >12s, assume it's wedged even
@@ -82,6 +95,50 @@
     } finally {
       connecting = false;
     }
+  }
+
+  const KIND_DESCRIPTIONS: Record<string, string> = {
+    text:             "plain text, markdown, json, yaml, csv",
+    html:             "web pages, saved html",
+    pdf:              "pdfs (text + OCR fallback)",
+    docx:             "word documents",
+    image:            "photos & screenshots (OCR + local vision caption)",
+    audio:            "voice notes, recordings (transcribed via whisper)",
+    video:            "video files (transcribed + keyframe OCR)",
+    code:             "source code in any supported language",
+    "chatgpt-export": "full chatgpt / claude archive exports",
+  };
+
+  async function loadSettings() {
+    try {
+      const res = await fetchSettings();
+      allKinds = res.all_kinds;
+      disabledKinds = new Set(res.settings.disabled_kinds ?? []);
+      settingsLoaded = true;
+    } catch (e) {
+      pushFeed("settings", `load failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function toggleKind(kind: string) {
+    const next = new Set(disabledKinds);
+    if (next.has(kind)) next.delete(kind);
+    else next.add(kind);
+    disabledKinds = next;
+    savingSettings = true;
+    try {
+      const res = await updateSettings({ disabled_kinds: Array.from(next) });
+      disabledKinds = new Set(res.settings.disabled_kinds ?? []);
+    } catch (e) {
+      pushFeed("settings", `save failed: ${(e as Error).message}`);
+    } finally {
+      savingSettings = false;
+    }
+  }
+
+  async function openSettings() {
+    showSettings = true;
+    if (!settingsLoaded) await loadSettings();
   }
 
   const KIND_LABELS: Record<string, string> = {
@@ -455,7 +512,12 @@
           else logLine("vision", line);
         },
       );
-      unlistens.push(() => unlistenDrop(), () => unlistenEnter(), () => unlistenLeave(), () => unlistenVision());
+      // Sidecar bootstrap (first-launch venv + pip) progress. Show overlay
+      // until state==="ready"; "error" leaves the overlay up with the msg.
+      const unlistenSidecar = await onSidecarStatus((s) => {
+        sidecar = s;
+      });
+      unlistens.push(() => unlistenDrop(), () => unlistenEnter(), () => unlistenLeave(), () => unlistenVision(), unlistenSidecar);
     })();
 
     // Braille spinner tick for in-flight rows. 10 fps is smooth without thrash.
@@ -507,30 +569,57 @@
           ? `Sidecar ready · ${config?.api_base ?? ""}`
           : conn === "connecting"
             ? "Connecting to sidecar…"
-            : "Sidecar unreachable. Click Restart."}
+            : conn === "unreachable"
+              ? "Sidecar unreachable. Check that Python 3.10+ is installed and click Settings → Restart."
+              : "Sidecar restarting…"}
       >
         <span class="status-dot"></span>
-        {conn === "open" ? "ready" : conn === "connecting" ? "starting" : "offline"}
+        {conn === "open"
+          ? "ready"
+          : conn === "connecting"
+            ? "starting"
+            : conn === "unreachable"
+              ? "offline"
+              : "reconnecting"}
       </span>
-      <button
-        class="ghost"
-        onclick={handleRestart}
-        disabled={restarting}
-        title="Kill and respawn the Python sidecar"
-      >
-        {restarting ? "restarting…" : "Restart"}
-      </button>
       <button class="ghost" onclick={() => (showContents = true)} title="View indexed sources and search">
         Contents
       </button>
-      <button class="ghost" onclick={runConnect} disabled={connecting} title="Add Minion to Claude Desktop's mcpServers">
-        {connecting ? "connecting…" : "Connect"}
+      <button class="ghost" onclick={openSettings} title="Server, Claude Desktop, and file-type preferences">
+        Settings
       </button>
     </div>
   </header>
 
   {#if connectMsg}
     <div class="toast">{connectMsg}</div>
+  {/if}
+
+  {#if sidecar && sidecar.state !== "ready"}
+    <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
+      <div class="bootstrap-card">
+        <div class="bootstrap-title">
+          {#if sidecar.state === "error"}
+            Minion can't start
+          {:else if sidecar.state === "installing"}
+            Setting up Minion
+          {:else if sidecar.state === "bootstrapping"}
+            Creating environment
+          {:else}
+            Starting
+          {/if}
+        </div>
+        <div class="bootstrap-msg">
+          {sidecar.message ?? "Working…"}
+        </div>
+        {#if sidecar.state !== "error"}
+          <div class="bootstrap-spinner"></div>
+          <div class="bootstrap-hint">First launch only — this won't happen again.</div>
+        {:else}
+          <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
+        {/if}
+      </div>
+    </div>
   {/if}
 
   <section class="drop" class:active={dragging} role="button" tabindex="0" onclick={browseForFiles} onkeydown={(e) => e.key === "Enter" && browseForFiles()}>
@@ -586,6 +675,92 @@
     </div>
   </section>
 </main>
+
+{#if showSettings}
+  <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
+    <div class="modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+      <header class="modal-head">
+        <h2>Settings</h2>
+        <div class="modal-meta">server · claude desktop · file types</div>
+        <button class="ghost" onclick={() => (showSettings = false)}>Close</button>
+      </header>
+
+      <div class="modal-section settings-section">
+        <div class="section-title small">Server</div>
+        <div class="setting-row">
+          <div class="setting-main">
+            <div class="setting-label">Sidecar status</div>
+            <div class="setting-desc">
+              {conn === "open"
+                ? `ready · ${config?.api_base ?? ""}`
+                : conn === "connecting"
+                  ? "starting up…"
+                  : "unreachable — try Restart"}
+            </div>
+          </div>
+          <button
+            class="ghost"
+            onclick={handleRestart}
+            disabled={restarting}
+            title="Kill and respawn the Python sidecar"
+          >
+            {restarting ? "restarting…" : "Restart"}
+          </button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-main">
+            <div class="setting-label">Claude Desktop</div>
+            <div class="setting-desc">
+              {connectMsg || "Register Minion in Claude Desktop's mcpServers."}
+            </div>
+          </div>
+          <button
+            class="ghost"
+            onclick={runConnect}
+            disabled={connecting}
+            title="Add Minion to Claude Desktop's mcpServers"
+          >
+            {connecting ? "connecting…" : "Connect"}
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-section settings-section">
+        <div class="section-title small">
+          File types
+          <span class="section-hint">{savingSettings ? "saving…" : "toggle what Minion ingests"}</span>
+        </div>
+        {#if !settingsLoaded}
+          <div class="empty">Loading…</div>
+        {:else}
+          <ul class="kind-list">
+            {#each allKinds as k}
+              {@const enabled = !disabledKinds.has(k)}
+              <li class="kind-row" class:kind-off={!enabled}>
+                <label class="kind-toggle">
+                  <input
+                    type="checkbox"
+                    checked={enabled}
+                    onchange={() => toggleKind(k)}
+                    disabled={savingSettings}
+                  />
+                  <span class="kind-name">
+                    <span class="kind kind-{k === 'chatgpt-export' ? 'chatgpt-export' : k}">{(KIND_LABELS[k] ?? k).toLowerCase()}</span>
+                  </span>
+                  <span class="kind-desc">{KIND_DESCRIPTIONS[k] ?? ""}</span>
+                </label>
+              </li>
+            {/each}
+          </ul>
+          <div class="settings-note">
+            Files of disabled kinds are left alone on disk — Minion will log
+            them as skipped. Re-enable and restart the sidecar to pick them up.
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if showContents}
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showContents = false)} onkeydown={(e) => e.key === "Escape" && (showContents = false)}>
@@ -827,10 +1002,12 @@
   }
   .status-open    { color: var(--accent);  border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
   .status-connecting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--border)); }
-  .status-closed  { color: var(--danger);  border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
+  .status-closed  { color: var(--warn);  border-color: color-mix(in srgb, var(--warn) 35%, var(--border)); }
+  .status-unreachable { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: color-mix(in srgb, var(--danger) 6%, var(--panel)); }
   .status-open .status-dot       { background: var(--accent); animation: statuspulse 2.4s ease-in-out infinite; }
   .status-connecting .status-dot { background: var(--warn); animation: blink 0.9s ease-in-out infinite; }
-  .status-closed .status-dot     { background: var(--danger); }
+  .status-closed .status-dot     { background: var(--warn); animation: blink 0.9s ease-in-out infinite; }
+  .status-unreachable .status-dot { background: var(--danger); }
   @keyframes statuspulse {
     0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
     50%      { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
@@ -851,6 +1028,62 @@
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-s);
   }
+
+  .bootstrap-overlay {
+    position: fixed;
+    inset: 0;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+  }
+  .bootstrap-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 28px 32px;
+    max-width: 440px;
+    text-align: center;
+    box-shadow: var(--shadow-m);
+  }
+  .bootstrap-title {
+    font-family: var(--ui-font);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 8px;
+  }
+  .bootstrap-msg {
+    font-family: var(--ui-font);
+    font-size: 13px;
+    color: var(--ink-dim);
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+  }
+  .bootstrap-spinner {
+    width: 28px;
+    height: 28px;
+    margin: 0 auto 14px;
+    border: 3px solid color-mix(in srgb, var(--accent) 20%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 900ms linear infinite;
+  }
+  .bootstrap-hint {
+    font-family: var(--ui-font);
+    font-size: 11.5px;
+    color: var(--ink-faint, var(--ink-dim));
+    opacity: 0.75;
+  }
+  .bootstrap-overlay.error .bootstrap-card {
+    border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  }
+  .bootstrap-overlay.error .bootstrap-title {
+    color: var(--danger);
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Buttons: warm, soft, friendly. Teal primary, ghost for secondary. */
   button {
@@ -1396,6 +1629,100 @@
   .file-actions {
     display: flex;
     gap: 4px;
+  }
+
+  /* Settings modal: roomy rows, plain-language toggles. */
+  .settings-section .section-hint {
+    font-family: var(--ui-font);
+    font-size: 10.5px;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel);
+    margin-bottom: 8px;
+  }
+  .setting-row:last-child { margin-bottom: 0; }
+  .setting-main { min-width: 0; flex: 1; }
+  .setting-label {
+    font-family: var(--ui-font);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .setting-desc {
+    margin-top: 2px;
+    font-family: var(--ui-font);
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+
+  .kind-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .kind-row {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .kind-row:last-child { border-bottom: none; }
+  .kind-row:hover { background: color-mix(in srgb, var(--accent) 3%, var(--panel-2)); }
+  .kind-toggle {
+    display: grid;
+    grid-template-columns: 20px auto 1fr;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    cursor: pointer;
+  }
+  .kind-toggle input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .kind-name {
+    font-family: var(--num-font);
+    font-size: 11.5px;
+    font-weight: 600;
+    min-width: 6rem;
+  }
+  .kind-desc {
+    font-family: var(--ui-font);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .kind-off .kind-name,
+  .kind-off .kind-desc { opacity: 0.55; }
+  .kind-off .kind-name .kind::before { background: var(--dim); }
+
+  .settings-note {
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: color-mix(in srgb, var(--accent) 5%, var(--panel-2));
+    border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    font-family: var(--ui-font);
+    font-size: 11.5px;
+    color: var(--ink-2);
+    line-height: 1.5;
   }
 
   /* Hide the legacy Svelte scrollbars in favor of the OS's native thin one. */

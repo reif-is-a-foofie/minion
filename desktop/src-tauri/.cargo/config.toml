@@ -1,0 +1,17 @@
+# Scrub the host-machine username out of the shipped binary. Third-party
+# crates embed `file!()` paths into panic/assert messages — by default those
+# bake the builder's absolute path into the .app (e.g. `/Users/<builder>/
+# .cargo/registry/.../tao-0.34.8/src/...`). Remap the cargo registry and the
+# crate source root to stable, host-agnostic markers so the DMG is portable
+# and doesn't leak any identity.
+
+[target.'cfg(all())']
+rustflags = [
+  "--remap-path-prefix", "/Users/reify/.cargo/registry/src=/cargo/registry",
+  "--remap-path-prefix", "/Users/reify/.cargo/registry=/cargo/registry",
+  "--remap-path-prefix", "/Users/reify/.rustup/toolchains=/rustup",
+  "--remap-path-prefix", "/Users/reify/Classified/minion=/minion",
+]
+
+[profile.release]
+strip = "symbols"
