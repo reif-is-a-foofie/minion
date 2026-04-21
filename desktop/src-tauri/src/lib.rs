@@ -213,6 +213,9 @@ const DEFAULT_VISION_MODEL: &str = "moondream";
 /// User may override via `MINION_DELIGHT_MODEL` / `MINION_TASTE_MODEL`.
 const DEFAULT_MINION_LLM: &str = "qwen2.5:0.5b";
 const OLLAMA_PORT: u16 = 11434;
+/// When no system Python exists, bundled `uv` downloads this CPython into
+/// `<data_dir>/managed-python/` (see `scripts/ensure_uv.sh`).
+const MANAGED_PYTHON_SPEC: &str = "3.12";
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -478,6 +481,128 @@ fn venv_python(data_dir: &Path) -> PathBuf {
     }
 }
 
+fn managed_python_install_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("managed-python")
+}
+
+fn forward_proxy_env(cmd: &mut Command) {
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+}
+
+/// Bundled Astral `uv` (see `scripts/ensure_uv.sh`). Standalone — no Python required.
+fn resolve_bundled_uv(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MINION_UV_BIN") {
+        let pb = PathBuf::from(p.trim());
+        if pb.is_file() {
+            dbg(
+                "bundled_uv",
+                serde_json::json!({"via": "MINION_UV_BIN", "path": pb}),
+            );
+            return Some(pb);
+        }
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        #[cfg(windows)]
+        let candidate = res.join("bin").join("uv.exe");
+        #[cfg(not(windows))]
+        let candidate = res.join("bin").join("uv");
+        if candidate.is_file() {
+            dbg(
+                "bundled_uv",
+                serde_json::json!({"via": "resources", "path": candidate}),
+            );
+            return Some(candidate);
+        }
+    }
+    dbg("bundled_uv", serde_json::json!({"via": "none"}));
+    None
+}
+
+/// Download CPython via `uv python install` and create `venv/` — used when
+/// `python3` is not on PATH (typical for GUI apps started outside a shell).
+fn bootstrap_venv_with_managed_uv(
+    app: &AppHandle,
+    data_dir: &Path,
+    uv: &Path,
+) -> Result<(), String> {
+    let emit = |stage: &str, message: &str| {
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({"state": stage, "message": message}),
+        );
+    };
+    let install_dir = managed_python_install_dir(data_dir);
+    let _ = fs::create_dir_all(&install_dir);
+
+    shell_log(
+        "INFO",
+        "no system Python on PATH; installing CPython with bundled uv",
+    );
+    emit(
+        "bootstrapping",
+        "Downloading Python (bundled installer — needs network, first launch only)…",
+    );
+
+    let mut cmd_install = Command::new(uv);
+    cmd_install
+        .args(["python", "install", MANAGED_PYTHON_SPEC])
+        .env("UV_PYTHON_INSTALL_DIR", &install_dir);
+    forward_proxy_env(&mut cmd_install);
+    let st = cmd_install.status().map_err(|e| {
+        let msg = format!("uv python install failed to start: {e}");
+        emit("error", &msg);
+        msg
+    })?;
+    if !st.success() {
+        let msg = format!(
+            "Downloading Python failed (uv exit {}). Check network or set HTTP_PROXY; see logs.",
+            st.code().unwrap_or(-1)
+        );
+        emit("error", &msg);
+        return Err(msg);
+    }
+
+    let venv_dir = data_dir.join("venv");
+    if venv_dir.exists() {
+        let _ = fs::remove_dir_all(&venv_dir);
+    }
+
+    emit("bootstrapping", "Creating virtual environment…");
+    let mut cmd_venv = Command::new(uv);
+    cmd_venv
+        .args([
+            "venv",
+            venv_dir.to_string_lossy().as_ref(),
+            "--python",
+            MANAGED_PYTHON_SPEC,
+        ])
+        .env("UV_PYTHON_INSTALL_DIR", &install_dir);
+    forward_proxy_env(&mut cmd_venv);
+    let st2 = cmd_venv.status().map_err(|e| {
+        let msg = format!("uv venv failed to start: {e}");
+        emit("error", &msg);
+        msg
+    })?;
+    if !st2.success() {
+        let msg = format!(
+            "venv creation failed (uv exit {}).",
+            st2.code().unwrap_or(-1)
+        );
+        emit("error", &msg);
+        return Err(msg);
+    }
+
+    dbg(
+        "bootstrap",
+        serde_json::json!({"state": "uv_venv_done", "venv": venv_dir}),
+    );
+    Ok(())
+}
+
 /// Create `<data_dir>/venv` and pip-install the sidecar requirements. Streams
 /// `sidecar://status` events so the UI can show "Setting up Minion…" on first
 /// launch. Idempotent: if the venv already has the sidecar imports working,
@@ -502,50 +627,60 @@ fn bootstrap_venv(
         );
     };
 
-    // Find a usable system Python. If none, raise a clear, actionable error
-    // that the UI can surface verbatim.
-    let (system_py, ver) = find_system_python().ok_or_else(|| {
-        let msg = "Python 3.10+ not found on PATH. Install from https://www.python.org/downloads/ and relaunch Minion.".to_string();
-        emit("error", &msg);
-        dbg("bootstrap", serde_json::json!({"state": "no_python"}));
-        msg
-    })?;
-    dbg("bootstrap", serde_json::json!({"system_python": system_py, "version": ver}));
-
-    if !py.exists() {
-        emit("bootstrapping", "Creating Python environment…");
-        let status = Command::new(&system_py)
-            .arg("-m")
-            .arg("venv")
-            .arg(data_dir.join("venv"))
-            .status()
-            .map_err(|e| {
-                let msg = format!("venv launch failed: {e}");
+    // Prefer system Python 3.10+. If none (common for Finder-launched macOS apps),
+    // use bundled `uv` to download CPython — no manual python.org install.
+    match find_system_python() {
+        Some((system_py, ver)) => {
+            dbg(
+                "bootstrap",
+                serde_json::json!({"system_python": system_py, "version": ver}),
+            );
+            if !py.exists() {
+                emit("bootstrapping", "Creating Python environment…");
+                let status = Command::new(&system_py)
+                    .arg("-m")
+                    .arg("venv")
+                    .arg(data_dir.join("venv"))
+                    .status()
+                    .map_err(|e| {
+                        let msg = format!("venv launch failed: {e}");
+                        emit("error", &msg);
+                        msg
+                    })?;
+                if !status.success() {
+                    let msg =
+                        format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
+                    emit("error", &msg);
+                    dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
+                    return Err(msg);
+                }
+                // Upgrade pip; old pip on fresh Pythons sometimes can't resolve wheels.
+                let pip_up = Command::new(&py)
+                    .args(["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+                    .output();
+                if let Ok(ref out) = pip_up {
+                    if !out.status.success() {
+                        let log_dir = logs_dir(data_dir);
+                        let _ = fs::create_dir_all(&log_dir);
+                        let combined = String::from_utf8_lossy(&out.stdout).to_string()
+                            + &String::from_utf8_lossy(&out.stderr);
+                        let _ = fs::write(log_dir.join("pip-upgrade.log"), combined.trim());
+                        shell_log(
+                            "WARN",
+                            "pip self-upgrade failed; continuing install (see logs/pip-upgrade.log)",
+                        );
+                    }
+                }
+            }
+        }
+        None => {
+            dbg("bootstrap", serde_json::json!({"state": "no_system_python"}));
+            let uv = resolve_bundled_uv(app).ok_or_else(|| {
+                let msg = "Python was not found and the bundled installer (uv) is missing from this app. Reinstall Minion, or install Python 3.10+ from python.org and relaunch.".to_string();
                 emit("error", &msg);
                 msg
             })?;
-        if !status.success() {
-            let msg = format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
-            emit("error", &msg);
-            dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
-            return Err(msg);
-        }
-        // Upgrade pip; old pip on fresh Pythons sometimes can't resolve wheels.
-        let pip_up = Command::new(&py)
-            .args(["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-            .output();
-        if let Ok(ref out) = pip_up {
-            if !out.status.success() {
-                let log_dir = logs_dir(data_dir);
-                let _ = fs::create_dir_all(&log_dir);
-                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                    + &String::from_utf8_lossy(&out.stderr);
-                let _ = fs::write(log_dir.join("pip-upgrade.log"), combined.trim());
-                shell_log(
-                    "WARN",
-                    "pip self-upgrade failed; continuing install (see logs/pip-upgrade.log)",
-                );
-            }
+            bootstrap_venv_with_managed_uv(app, data_dir, &uv)?;
         }
     }
 
@@ -630,7 +765,7 @@ fn venv_has_core(py: &Path) -> bool {
     Command::new(py)
         .args([
             "-c",
-            "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; import trafilatura",
+            "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; from pypdf import PdfReader; import trafilatura",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

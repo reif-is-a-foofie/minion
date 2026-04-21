@@ -390,6 +390,14 @@
   }
 
   /** Short headline for the rollup row (same reason → one updating line). */
+  /** Match watcher ingest paths to Tauri copy dests (macOS /private/var vs /var). */
+  function inboxPathKey(p: string): string {
+    return p.replaceAll("\\", "/").replace(/^\/private\//, "/");
+  }
+
+  /** Feed row id: we merge ingest skip/success into this row after a file copy. */
+  let pendingIngestRowId: Record<string, string> = $state({});
+
   function rollupHeadline(reason: string): string {
     const d = /^disabled:\s*'([^']+)'/i.exec(reason);
     if (d) {
@@ -417,6 +425,9 @@
     if (/missing-deps:.*pypdf|missing-deps:.*requirements/i.test(reason)) {
       return "Skipping PDF (sidecar venv missing PDF libs — see Settings → File logs / pip-bootstrap.log; delete data/venv and relaunch)";
     }
+    if (/missing-deps:/i.test(reason)) {
+      return "Skipping PDF (fix sidecar deps — see Settings → File logs; delete data/venv and relaunch)";
+    }
     const one = reason.replace(/^parse-error:\s*/i, "").trim();
     const short = one.length > 80 ? `${one.slice(0, 77)}…` : one;
     return `Skipping: ${short}`;
@@ -438,6 +449,33 @@
     const key = rollupReasonKey(reason);
     const headline = rollupHeadline(reason);
     const status = `${headline} · ${frac}`;
+
+    // Merge into the same row as "copied" so we never show ✓ then a separate
+    // contradictory skip line for the same inbox file.
+    if (path) {
+      const pk = inboxPathKey(path);
+      let rowId = pendingIngestRowId[pk];
+      if (!rowId) {
+        for (const [k, id] of Object.entries(pendingIngestRowId)) {
+          if (inboxPathKey(k) === pk) {
+            rowId = id;
+            break;
+          }
+        }
+      }
+      if (rowId) {
+        const next = { ...pendingIngestRowId };
+        for (const k of Object.keys(next)) {
+          if (next[k] === rowId) delete next[k];
+        }
+        pendingIngestRowId = next;
+        updateFeed(rowId, {
+          path,
+          status: `inbox copy kept · ${headline} · ${frac}`,
+        });
+        return;
+      }
+    }
 
     if (skipRollup && skipRollup.key === key) {
       updateFeed(skipRollup.feedId, { path: "⊘ batch", status });
@@ -584,7 +622,8 @@
         let status: string;
         if (d.kind === "missing") status = "missing (no such path)";
         else if (d.kind === "unsupported") status = "skipped (not a file or folder)";
-        else if (d.kind === "duplicate") status = `duplicate · already in inbox (${prettyBytes(d.bytes)})`;
+        else if (d.kind === "duplicate")
+          status = `duplicate · already in inbox (${prettyBytes(d.bytes)}) — remove that inbox file to drop again after fixing index errors`;
         else if (d.copied === 0) status = "empty (nothing to index)";
         else if (d.kind === "directory") {
           const extra = d.skipped_dirs ? `, pruned ${d.skipped_dirs} dirs` : "";
@@ -594,6 +633,17 @@
         }
         if (id) updateFeed(id, { path: landed, status });
         else pushFeed(landed, status);
+        if (id && d.kind !== "duplicate" && d.kind !== "missing" && d.kind !== "unsupported") {
+          if (d.kind === "file" && landed && (d.copied ?? 0) > 0) {
+            pendingIngestRowId = { ...pendingIngestRowId, [inboxPathKey(landed)]: id };
+          } else if (d.kind === "directory" && d.paths?.length) {
+            const next = { ...pendingIngestRowId };
+            for (const q of d.paths) {
+              next[inboxPathKey(q)] = id;
+            }
+            pendingIngestRowId = next;
+          }
+        }
         for (const err of d.errors ?? []) pushFeed(d.source, `error: ${err}`);
       }
     } catch (e) {
@@ -637,7 +687,7 @@
       // On first launch `refreshStatus`/`fetchSources` reject until pip finishes —
       // if those run first the whole IIFE threw and we never subscribed to
       // `sidecar://status`, so the UI stayed on "starting" forever.
-      const closeWs = await openEvents(
+      const wsHandle = await openEvents(
         async (msg) => {
         lastHeartbeat = Date.now();
         // If we're receiving messages the socket is obviously open, even
@@ -682,7 +732,15 @@
         } else if (msg.type === "source_updated") {
           if (msg.active) active = msg.active;
           const r = msg.result as { path?: string; chunk_count?: number };
-          if (r.path) endLine(r.path, `ingested · ${r.chunk_count ?? 0} chunks`);
+          if (r.path) {
+            const pk = inboxPathKey(r.path);
+            const next = { ...pendingIngestRowId };
+            for (const k of Object.keys(next)) {
+              if (inboxPathKey(k) === pk) delete next[k];
+            }
+            pendingIngestRowId = next;
+            endLine(r.path, `ingested · ${r.chunk_count ?? 0} chunks`);
+          }
           await refreshSources();
         } else if (msg.type === "ingest_delight") {
           const line = msg.line.trim();
@@ -707,7 +765,7 @@
           if (s === "open") lastHeartbeat = Date.now();
         },
       );
-      unlistens.push(closeWs);
+      unlistens.push(() => wsHandle.stop());
       unlistens.push(() => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         heartbeatTimer = null;
@@ -716,6 +774,7 @@
       // Sidecar bootstrap progress (venv / pip).
       const unlistenSidecar = await onSidecarStatus((s) => {
         sidecar = s;
+        if (s.state === "ready") wsHandle.resetReconnectBudget();
       });
       unlistens.push(unlistenSidecar);
 
