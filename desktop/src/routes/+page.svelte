@@ -1051,25 +1051,28 @@
   .term-head, .term-foot {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 4px 10px;
-    font-family: var(--mono-font);
-    font-size: 11px;
-    color: var(--dim);
-    letter-spacing: 0.04em;
+    gap: 10px;
+    padding: 6px 14px;
+    font-family: var(--num-font);
+    font-size: 10.5px;
+    color: var(--muted);
+    letter-spacing: 0.02em;
     user-select: none;
+    background: color-mix(in srgb, var(--accent) 3%, var(--panel-2));
   }
   .term-head  { border-bottom: 1px dashed var(--border); }
   .term-foot  { border-top: 1px dashed var(--border); }
-  .term-corner { color: var(--border-strong); }
+  .term-corner { color: color-mix(in srgb, var(--accent) 45%, var(--border-strong)); }
   .term-title {
-    color: var(--ink);
+    color: var(--accent);
     text-transform: uppercase;
     font-weight: 600;
-    letter-spacing: 0.12em;
-    padding: 0 6px;
-    background: var(--panel-3);
-    border-radius: 2px;
+    letter-spacing: 0.16em;
+    padding: 2px 8px;
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
+    border-radius: 999px;
+    font-size: 10px;
   }
   .term-rule {
     flex: 1;
@@ -1224,61 +1227,68 @@
 
   .section-title {
     font-family: var(--ui-font);
-    font-size: 10px;
+    font-size: 11px;
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.14em;
     color: var(--muted);
-    margin: 0 0 12px;
+    margin: 0 0 14px;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
   }
-  .section-title.small { margin: 0 0 10px; }
-  .section-title::before { content: "// "; color: var(--dim); }
+  .section-title.small { margin: 0 0 12px; }
 
   .chips {
     display: flex;
-    gap: 0;
+    gap: 6px;
     flex-wrap: wrap;
   }
   .chips button {
     background: var(--panel);
     color: var(--muted);
     border: 1px solid var(--border-strong);
-    margin-left: -1px; /* collapse borders for TUI strip */
-    font-family: var(--mono-font);
-    font-size: 10.5px;
-    padding: 3px 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    border-radius: 0;
+    font-family: var(--ui-font);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 11px;
+    text-transform: none;
+    letter-spacing: 0;
+    border-radius: 999px;
+    box-shadow: none;
   }
-  .chips button:first-child { margin-left: 0; }
-  .chips button:hover { color: var(--ink); border-color: var(--ink); z-index: 1; }
+  .chips button:hover {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--border-strong));
+    background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  }
   .chips button.chip-active {
-    background: var(--ink);
+    background: var(--accent);
     color: #fff;
-    border-color: var(--ink);
-    z-index: 2;
+    border-color: var(--accent);
   }
-  .count { opacity: 0.7; margin-left: 6px; font-variant-numeric: tabular-nums; }
+  .count { opacity: 0.75; margin-left: 6px; font-variant-numeric: tabular-nums; font-family: var(--num-font); }
 
   .hit {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 0;
-    padding: 12px 14px;
-    margin-bottom: 6px;
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    margin-bottom: 8px;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
   }
-  .hit:hover { border-color: var(--border-strong); }
+  .hit:hover {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-strong));
+    box-shadow: var(--shadow-s);
+  }
   .hit header {
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-bottom: 6px;
-    font-family: var(--mono-font);
-    font-size: 11px;
+    margin-bottom: 8px;
+    font-family: var(--num-font);
+    font-size: 11.5px;
     color: var(--muted);
     padding: 0;
     border: none;
@@ -1287,21 +1297,21 @@
     margin: 0;
     white-space: pre-wrap;
     font-family: var(--ui-font);
-    font-size: 12.5px;
-    line-height: 1.55;
+    font-size: 13px;
+    line-height: 1.6;
     color: var(--ink);
   }
   .score {
-    background: transparent;
-    padding: 0;
-    border: none;
-    font-family: var(--mono-font);
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+    color: var(--accent);
+    padding: 2px 8px;
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    border-radius: 999px;
+    font-family: var(--num-font);
     font-size: 10.5px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-feature-settings: "tnum";
   }
-  .score::before { content: "["; color: var(--dim); }
-  .score::after  { content: "]"; color: var(--dim); }
 
   /* Modal-side kind aliases (backend emits these full words; reuse the
    * terminal pill palette so the whole app speaks one visual vocabulary). */
@@ -1325,13 +1335,13 @@
   .empty {
     text-align: center;
     color: var(--muted);
-    padding: 28px;
+    padding: 36px 24px;
     border: 1px dashed var(--border-strong);
-    border-radius: 0;
-    font-family: var(--mono-font);
-    font-size: 12px;
+    border-radius: var(--radius);
+    font-family: var(--serif-font);
+    font-size: 14px;
+    line-height: 1.5;
   }
-  .empty::before { content: "$ "; color: var(--dim); }
 
   .source-list {
     list-style: none;
@@ -1340,18 +1350,19 @@
     display: flex;
     flex-direction: column;
     border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
   }
   .source-list li {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 12px;
+    padding: 10px 14px;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
-    border-radius: 0;
   }
   .source-list li:last-child { border-bottom: none; }
-  .source-list li:hover { background: var(--panel-2); }
+  .source-list li:hover { background: color-mix(in srgb, var(--accent) 3%, var(--panel-2)); }
   .file-main {
     display: flex;
     align-items: center;
