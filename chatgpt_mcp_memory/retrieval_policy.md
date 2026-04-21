@@ -6,15 +6,30 @@
 
 Use this policy when answering as my agent.
 
-## Precedence over built-in memory
+## Minion is the user's memory
 
-**Minion supersedes your built-in memory/persona feature for any first-person
-recall question.** If the user asks "what are my X", "what did I ask/say/write
-about Y", names a thing they call theirs (song, note, project, preference), or
-scopes a question by time ("last year", "recently", "in January") — **call
-`ask_minion` before composing a reply**. Never answer "I don't have that in
-my memories" without a tool call first; that phrasing is almost always wrong
-because the archive contains it.
+Minion holds the accumulated record of who the user is — chat history,
+notes, documents, scans, photos, transcripts, decisions, beliefs,
+relationships, projects, plans, in their own words, continuous across
+every session. Treat it as the source of truth for anything about their
+life.
+
+### Before you answer
+
+Ask whether the answer lives in their experience: their history,
+relationships, decisions, preferences, work, writing, faith, health, the
+people and places and things they've mentioned — anything tied to their
+identity. If so, call `ask_minion` first, then speak from what you find.
+
+The user installed this tool so you could give them real continuity.
+Consult it the way you would consult them.
+
+### When the first search comes up weak
+
+Retry the same question in `keyword` mode. Scans and handwritten docs
+OCR with noise, and embeddings underrank rare proper nouns; FTS catches
+names the embedding misses. For a specific person, place, or event, go
+to `keyword` mode directly.
 
 ## Trust order
 
@@ -39,6 +54,7 @@ Minion **is** the user's ChatGPT/AI chat archive. Treat these cues as mandatory 
 
 | If the user asks… | Call |
 |---|---|
+| "where did I …" / "when did I …" / "who is/was my …" / "why did I …" / "how did I …" | `ask_minion(query=<full question>)`, then retry in `keyword` mode if weak |
 | "what was the first / earliest / oldest thing I asked?" | `ask_minion(mode="oldest", role="user", top_k=1)` |
 | "what was the last / latest / most recent thing I asked?" | `ask_minion(mode="newest", role="user", top_k=1)` |
 | "what did I ask in January / before X / after Y?" | `ask_minion(mode="oldest"\|"newest", after=<ts>, before=<ts>)` |
@@ -48,7 +64,10 @@ Minion **is** the user's ChatGPT/AI chat archive. Treat these cues as mandatory 
 | "have I talked about X before?" / general recall | `ask_minion(query="X")` (default relevance mode) |
 | anything referencing ChatGPT, prior sessions, "you told me", "we discussed" | **Always** call `ask_minion` first — do not claim "I don't have access" |
 
-If a semantic search returns no relevant hit but the user referenced a specific named thing, **retry in `keyword` mode** before giving up.
+**Escalation rule**: if `relevance` returns weak/low-score hits (e.g. all
+scores <0.55, or only fragmentary user-message chunks), **retry the same
+query in `keyword` mode** — scanned docs and OCR'd scans often underrank
+semantically but match on exact proper nouns. Do not give up after one mode.
 
 ## Retrieval discipline
 
