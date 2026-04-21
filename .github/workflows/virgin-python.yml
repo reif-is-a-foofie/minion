@@ -1,0 +1,31 @@
+# Installs Minion Python deps from scratch (no repo venv assumed).
+# Catches "works on my machine" drift: missing pins, broken wheels on Linux CI, etc.
+name: virgin-python
+on: [push, pull_request]
+
+jobs:
+  fresh-venv-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create empty venv and install only requirements.txt
+        run: |
+          set -eux
+          python -m venv /tmp/minion-clean-venv
+          /tmp/minion-clean-venv/bin/python -m pip install --upgrade pip setuptools wheel
+          /tmp/minion-clean-venv/bin/python -m pip install -r chatgpt_mcp_memory/requirements.txt
+
+      - name: Import gate (matches desktop first-launch venv_has_core)
+        run: |
+          /tmp/minion-clean-venv/bin/python -c \
+            "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; import trafilatura"
+
+      - name: API smoke tests using the same interpreter
+        run: |
+          /tmp/minion-clean-venv/bin/python -m pip install pytest httpx websockets
+          /tmp/minion-clean-venv/bin/python -m pytest chatgpt_mcp_memory/tests/test_api_smoke.py -v

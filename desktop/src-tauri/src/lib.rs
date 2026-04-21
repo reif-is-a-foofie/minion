@@ -76,6 +76,18 @@ fn shell_log(level: &str, msg: &str) {
     eprintln!("[minion] {msg}");
 }
 
+/// Last `max` bytes of `s` (UTF-8 safe); for error dialogs.
+fn tail_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len().saturating_sub(max);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 fn append_sidecar_log_separator(data_dir: &Path) {
     let path = logs_dir(data_dir).join("sidecar.log");
     let Ok(_guard) = LOG_MUTEX.lock() else {
@@ -518,10 +530,23 @@ fn bootstrap_venv(
             dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
             return Err(msg);
         }
-        // Upgrade pip quietly; old pip on fresh Pythons sometimes can't resolve.
-        let _ = Command::new(&py)
-            .args(["-m", "pip", "install", "--upgrade", "--quiet", "pip"])
-            .status();
+        // Upgrade pip; old pip on fresh Pythons sometimes can't resolve wheels.
+        let pip_up = Command::new(&py)
+            .args(["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+            .output();
+        if let Ok(ref out) = pip_up {
+            if !out.status.success() {
+                let log_dir = logs_dir(data_dir);
+                let _ = fs::create_dir_all(&log_dir);
+                let combined = String::from_utf8_lossy(&out.stdout).to_string()
+                    + &String::from_utf8_lossy(&out.stderr);
+                let _ = fs::write(log_dir.join("pip-upgrade.log"), combined.trim());
+                shell_log(
+                    "WARN",
+                    "pip self-upgrade failed; continuing install (see logs/pip-upgrade.log)",
+                );
+            }
+        }
     }
 
     if !py.exists() {
@@ -535,20 +560,62 @@ fn bootstrap_venv(
 
     emit(
         "installing",
-        "Installing dependencies (first launch, ~2 min)…",
+        "Installing dependencies (first launch, ~2 min; needs network)…",
     );
     dbg("bootstrap", serde_json::json!({"state": "pip_start", "requirements": requirements}));
-    let status = Command::new(&py)
-        .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
+    let pip_out = Command::new(&py)
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "-r",
+        ])
         .arg(requirements)
-        .status()
+        .output()
         .map_err(|e| {
             let msg = format!("pip launch failed: {e}");
             emit("error", &msg);
+            shell_log("ERROR", &msg);
             msg
         })?;
-    if !status.success() {
-        let msg = format!("pip install failed (exit {})", status.code().unwrap_or(-1));
+
+    let log_dir = logs_dir(data_dir);
+    let _ = fs::create_dir_all(&log_dir);
+    let pip_log = log_dir.join("pip-bootstrap.log");
+    let pip_combined = format!(
+        "=== pip install -r {} ===\nstdout:\n{}\nstderr:\n{}\n",
+        requirements.display(),
+        String::from_utf8_lossy(&pip_out.stdout),
+        String::from_utf8_lossy(&pip_out.stderr)
+    );
+    let _ = fs::write(&pip_log, pip_combined.trim_end());
+    shell_log(
+        if pip_out.status.success() { "INFO" } else { "ERROR" },
+        &format!(
+            "pip install exit={} log={}",
+            pip_out.status.code().unwrap_or(-1),
+            pip_log.display()
+        ),
+    );
+
+    if !pip_out.status.success() {
+        let tail = tail_utf8(&pip_combined, 2800);
+        let ssl_hint = if pip_combined.contains("SSL")
+            || pip_combined.contains("CERTIFICATE_VERIFY_FAILED")
+            || pip_combined.contains("certificate")
+        {
+            " This often means Python SSL certificates are not installed (python.org macOS installer: run Install Certificates.command, or use Homebrew python)."
+        } else {
+            ""
+        };
+        let msg = format!(
+            "pip install failed (exit {}). Full log: {}. Tail:{}{}",
+            pip_out.status.code().unwrap_or(-1),
+            pip_log.display(),
+            ssl_hint,
+            tail
+        );
         emit("error", &msg);
         dbg("bootstrap", serde_json::json!({"state": "pip_failed"}));
         return Err(msg);
@@ -561,7 +628,10 @@ fn bootstrap_venv(
 /// Avoids a ~2min pip re-run on every launch even though the venv exists.
 fn venv_has_core(py: &Path) -> bool {
     Command::new(py)
-        .args(["-c", "import fastapi, uvicorn, fastembed, watchdog, numpy"])
+        .args([
+            "-c",
+            "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; import trafilatura",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

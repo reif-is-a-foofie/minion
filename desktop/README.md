@@ -91,6 +91,22 @@ static frontend build; bundled resources include the Python tree the sidecar
 runs from. First launch of the `.app` still creates the venv and installs
 dependencies into the user’s data directory.
 
+## First launch (new machine)
+
+The app needs **Python 3.10+** on disk (not only in your shell `PATH` — Finder
+launched apps often miss Homebrew). It creates **`data/venv`** and runs
+**`pip install -r`** the bundled requirements (**network required**).
+
+If setup fails: open **Settings → File logs** and read **`pip-bootstrap.log`**
+(full pip stdout/stderr), **`minion-desktop.log`**, and **`sidecar.log`**.
+Common fixes: install Python from [python.org](https://www.python.org/downloads/)
+or Homebrew; on macOS with the python.org installer, run **Install
+Certificates.command** if pip reports SSL errors; delete **`…/Minion/data/venv`**
+and relaunch to retry a half-finished install.
+
+CI runs the same dependency set from an empty venv on every push (see
+`.github/workflows/virgin-python.yml`).
+
 ## Connect any MCP client
 
 The **Connect** control merges Minion into

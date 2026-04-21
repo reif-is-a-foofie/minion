@@ -46,7 +46,7 @@ alias minion="$PWD/../bin/minion"
 minion doctor
 ```
 
-Classic venv works too if you already have a Python 3.10+ you trust. See `chatgpt_mcp_memory/README.md` for the minimal requirements split (core vs PDFs vs images vs audio vs code).
+Classic venv works too if you already have a Python 3.10+ you trust. See `chatgpt_mcp_memory/README.md` for how requirements are split (core includes PDF/HTML/DOCX; optional extras for images, audio, code, etc.).
 
 ## Run it
 
@@ -76,7 +76,7 @@ npm run tauri dev
 
 Without the app, drop files into `data/inbox/`. The watcher inside `minion mcp` reconciles on startup and then live-watches. CRUD commands: `minion add`, `minion ls`, `minion rm`, `minion watch`.
 
-See [`desktop/README.md`](./desktop/README.md) for the app, [`chatgpt_mcp_memory/README.md`](./chatgpt_mcp_memory/README.md) for everything else (parsers, tool surface table, voice internals, env knobs).
+See [`desktop/README.md`](./desktop/README.md) for the app (includes **first-launch / new-machine** troubleshooting and log paths), [`chatgpt_mcp_memory/README.md`](./chatgpt_mcp_memory/README.md) for everything else (parsers, tool surface table, voice internals, env knobs).
 
 ## Privacy
 

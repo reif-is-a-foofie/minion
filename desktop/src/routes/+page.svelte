@@ -414,6 +414,9 @@
     if (/no module named ['"]docx['"]/i.test(reason)) {
       return "Skipping Word docs (pip install python-docx — then restart sidecar)";
     }
+    if (/missing-deps:.*pypdf|missing-deps:.*requirements/i.test(reason)) {
+      return "Skipping PDF (sidecar venv missing PDF libs — see Settings → File logs / pip-bootstrap.log; delete data/venv and relaunch)";
+    }
     const one = reason.replace(/^parse-error:\s*/i, "").trim();
     const short = one.length > 80 ? `${one.slice(0, 77)}…` : one;
     return `Skipping: ${short}`;

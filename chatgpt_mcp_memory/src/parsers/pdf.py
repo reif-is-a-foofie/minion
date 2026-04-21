@@ -2,7 +2,7 @@
 
 Distinguishes three failure modes so the UI can show actionable hints:
 - Missing dep  -> raises EmptyParse("missing-deps: ...") so caller can prompt
-                  the user to `pip install -r requirements-docs.txt`.
+                  the user to install PDF deps (normally bundled with core).
 - Image-only   -> raises EmptyParse("image-only: N pages, no selectable text.
                   OCR it first (see requirements-images.txt for OCR support).")
 - Real parse error -> re-raised so ingest surfaces "parse-error: ...".
@@ -40,7 +40,10 @@ def _extract_pypdf(path: Path) -> tuple[List[tuple[int, str]], int]:
     """Returns (pages_with_text, total_page_count)."""
     PdfReader = _import_pypdf()
     if PdfReader is None:
-        raise EmptyParse("missing-deps: install `pip install -r requirements-docs.txt` to enable PDF text extraction")
+        raise EmptyParse(
+            "missing-deps: install PDF stack with `pip install -r requirements.txt` "
+            "(includes pypdf and pdfminer.six) in the sidecar venv, then restart the sidecar"
+        )
     reader = PdfReader(str(path))
     total = len(reader.pages)
     out: List[tuple[int, str]] = []
