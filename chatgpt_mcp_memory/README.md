@@ -186,7 +186,7 @@ source .venv/bin/activate
 python src/ask_minion.py --derived-dir data/derived --model mistral:7b
 ```
 
-Or from the repo / Homebrew CLI:
+Or from the `bin/minion` CLI:
 
 ```bash
 minion ask_minion --derived-dir "/path/to/derived" --model mistral:7b

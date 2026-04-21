@@ -27,19 +27,30 @@ The voice tool (`commit_voice` on first run, `append_to_voice` after) is what tu
 
 ## Install
 
-Mac, Homebrew:
+Clone it, set up Python, done. Homebrew formula is dormant for now, running from the repo is the path.
+
+Prereqs: Python 3.10+, [Ollama](https://ollama.com) running with whatever model you want for the profile generator (default `mistral:7b`), Claude Desktop installed.
 
 ```bash
-brew tap reif-is-a-foofie/minion
-brew install minion
+git clone https://github.com/reif-is-a-foofie/minion.git
+cd minion/chatgpt_mcp_memory
+
+# uv is the cleanest way, works even if your system Python is a mess
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.11
+uv venv --python 3.11
+uv pip install -r requirements-all.txt
+
+# put bin/minion on your PATH or just alias it
+alias minion="$PWD/../bin/minion"
 minion doctor
 ```
 
-Prereqs: Ollama running, with whatever model you want for the profile generator (default `mistral:7b`).
+Classic venv works too if you already have a Python 3.10+ you trust. See `chatgpt_mcp_memory/README.md` for the minimal requirements split (core vs PDFs vs images vs audio vs code).
 
 ## Run it
 
-Open a terminal, type `minion`, hit enter. That's the whole interface. It asks you for the path to your ChatGPT export zip, unpacks it, builds the index, pulls persona evidence, writes `core_profile.md`, and merges the MCP entry into Claude Desktop's config (with a backup). One command, one pipeline.
+Type `minion`, hit enter. That's the whole interface. It asks you for the path to your ChatGPT export zip, unpacks it, builds the index, pulls persona evidence, writes `core_profile.md`, and merges the MCP entry into Claude Desktop's config (with a backup). One command, one pipeline.
 
 Non-interactive version for scripts:
 
