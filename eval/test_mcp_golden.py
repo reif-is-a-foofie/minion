@@ -272,6 +272,89 @@ def test_get_voice_tool_returns_voice(mcp_client):
     assert sc.get("char_count", 0) > 100
 
 
+def test_append_to_voice_roundtrip(request, tmp_path):
+    """append_to_voice adds content to a section; second call is idempotent; injection survives."""
+    derived_src = _resolve_derived_dir(request)
+    if derived_src is None:
+        pytest.skip("No --derived-dir / MINION_DERIVED_DIR.")
+    if not DEFAULT_SERVER_PY.exists():
+        pytest.skip(f"MCP server script missing: {DEFAULT_SERVER_PY}")
+
+    import shutil
+    derived = tmp_path / "derived"
+    shutil.copytree(derived_src, derived)
+    vp = derived / "voice.md"
+    if vp.exists():
+        vp.unlink()
+
+    # Seed voice.md via commit_voice so we're appending to a built profile.
+    seed = (
+        "### Typography\n- No em dashes.\n"
+        "### Formatting\n- Paragraphs over bullets.\n"
+        "### Length and density\n- No preamble.\n"
+        "### Tone and register\n- Direct, diagnostic.\n"
+        "### Style references\n- _(insufficient signal)_\n"
+        "### Hard nos\n- No hedging.\n"
+        "### Voice sample\nShort paragraphs. Claims earn their place.\n"
+    )
+
+    client = MCPStdioClient(server_py=DEFAULT_SERVER_PY, derived_dir=derived)
+    client.start()
+    try:
+        client.initialize()
+        assert client.call_tool("commit_voice", {"voice_markdown": seed}).get("structuredContent", {}).get("status") == "ok"
+
+        # First append replaces the insufficient-signal marker.
+        r1 = client.call_tool("append_to_voice", {
+            "section": "Style references",
+            "content": "Paul Graham essays. Terse, structured, claim-first.",
+        })
+        sc1 = r1.get("structuredContent") or {}
+        assert sc1.get("status") == "ok", f"first append failed: {sc1!r}"
+        assert sc1.get("appended") is True, "first append should write"
+
+        # Second identical append is idempotent.
+        r2 = client.call_tool("append_to_voice", {
+            "section": "Style references",
+            "content": "Paul Graham essays. Terse, structured, claim-first.",
+        })
+        sc2 = r2.get("structuredContent") or {}
+        assert sc2.get("status") == "ok"
+        assert sc2.get("appended") is False, "duplicate content should no-op"
+
+        # Third append (different content) adds to the same section.
+        r3 = client.call_tool("append_to_voice", {
+            "section": "Hard nos",
+            "content": "No AI-voiced prose. No self-effacing caveats.",
+        })
+        assert (r3.get("structuredContent") or {}).get("appended") is True
+
+        # Invalid section rejected.
+        r4 = client.call_tool("append_to_voice", {
+            "section": "NotASection",
+            "content": "whatever",
+        })
+        assert (r4.get("structuredContent") or {}).get("status") == "error"
+    finally:
+        client.stop()
+
+    # Verify persistence and injection.
+    body = vp.read_text(encoding="utf-8")
+    assert "Paul Graham essays" in body
+    assert "No AI-voiced prose" in body
+    # The original Style references stub should be gone.
+    assert "_(insufficient signal)_" not in body.split("### Style references")[1].split("###")[0]
+
+    client2 = MCPStdioClient(server_py=DEFAULT_SERVER_PY, derived_dir=derived)
+    client2.start()
+    try:
+        instr = (client2.initialize().get("result") or {}).get("instructions") or ""
+    finally:
+        client2.stop()
+    assert "Paul Graham essays" in instr, "appended directive not auto-injected in next session"
+    assert "No AI-voiced prose" in instr
+
+
 def test_conversation_chunks_roundtrip(mcp_client):
     """browse_conversations -> conversation_chunks returns chunks for that thread."""
     browse = mcp_client.call_tool(

@@ -880,11 +880,13 @@ def cmd_build_brief(args: argparse.Namespace) -> int:
 def cmd_build_voice(args: argparse.Namespace) -> int:
     """Ensure <derived>/voice.md exists as a bootstrap-ready skeleton.
 
-    voice.md is built by Claude itself on the first MCP session (via the
-    `bootstrap_voice` + `commit_voice` tools). This command only ensures the
-    skeleton file with both sentinels exists, so the MCP server can detect
-    "unbuilt" state and trigger the bootstrap. User hand-edits below the
-    <!-- MINION_VOICE_USER_EDITS --> sentinel are preserved across runs.
+    voice.md is built by Claude itself on the first MCP session: the bootstrap
+    directive in `initialize.instructions` drives Claude to gather evidence via
+    `ask_minion` + `browse_conversations`, then persist the synthesized profile
+    via `commit_voice`. This command only ensures the skeleton file with both
+    sentinels exists, so the MCP server can detect "unbuilt" state and trigger
+    the bootstrap. User hand-edits below the <!-- MINION_VOICE_USER_EDITS -->
+    sentinel are preserved across runs.
     """
     derived_dir = Path(args.derived_dir).expanduser().resolve()
     if not derived_dir.exists():

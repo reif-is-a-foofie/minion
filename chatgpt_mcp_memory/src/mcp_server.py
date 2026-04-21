@@ -40,6 +40,8 @@ from store import (
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
     USER_EDITS_SENTINEL,
+    VOICE_SECTIONS,
+    append_to_voice_file,
     build_skeleton as voice_build_skeleton,
     is_voice_built,
     write_auto_draft as voice_write_auto_draft,
@@ -618,6 +620,78 @@ def _tool_commit_voice(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_APPEND_MIN_CHARS = 3
+_APPEND_MAX_CHARS = 800
+
+
+def _tool_append_to_voice(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Append a single durable directive to one section of the voice profile.
+
+    Intended for mid-session capture: when the user explicitly signals a new
+    voice preference ("save this", "write like Didion", "never do Y again"),
+    Claude asks the user to confirm, then calls this tool to persist the
+    directive to the named H3 section of voice.md's AUTO_DRAFT block.
+
+    Idempotent: content that already exists (normalized) in the section is a
+    no-op. Preserves every other section and the USER_EDITS block.
+    """
+    section = (args.get("section") or "").strip()
+    content = (args.get("content") or "").strip()
+
+    if not section:
+        return {
+            "status": "error",
+            "error": f"section is required. Expected one of: {list(VOICE_SECTIONS)}",
+        }
+    if section not in VOICE_SECTIONS:
+        return {
+            "status": "error",
+            "error": f"unknown section {section!r}. Expected one of: {list(VOICE_SECTIONS)}",
+        }
+    if len(content) < _APPEND_MIN_CHARS:
+        return {
+            "status": "error",
+            "error": f"content too short ({len(content)} chars; min {_APPEND_MIN_CHARS}).",
+        }
+    if len(content) > _APPEND_MAX_CHARS:
+        return {
+            "status": "error",
+            "error": f"content too long ({len(content)} chars; max {_APPEND_MAX_CHARS}). "
+                     "Append short, durable directives, not long prose.",
+        }
+
+    path = _voice_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    chunks_path = _data_dir() / "chunks.jsonl"
+    n_chunks = 0
+    if chunks_path.is_file():
+        with chunks_path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                n_chunks += 1
+
+    try:
+        appended, new_bytes = append_to_voice_file(
+            path, section, content, n_chunks=n_chunks
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    return {
+        "status": "ok",
+        "appended": appended,
+        "section": section,
+        "voice_path": str(path),
+        "bytes": new_bytes,
+        "note": (
+            "Directive appended to voice.md AUTO_DRAFT block. It will be "
+            "injected into `initialize.instructions` on every future session."
+            if appended
+            else "Content already present in this section (by normalized match); no change written."
+        ),
+    }
+
+
 def _tool_index_info(_: Dict[str, Any]) -> Dict[str, Any]:
     conn = _get_conn()
     return {
@@ -738,6 +812,45 @@ TOOLS: List[Dict[str, Any]] = [
                 "voice_markdown": {
                     "type": "string",
                     "description": "Markdown body to write into the auto-draft block.",
+                },
+            },
+        },
+    },
+    {
+        "name": "append_to_voice",
+        "title": "Append one directive to the voice profile",
+        "description": (
+            "Append a single durable directive to one section of voice.md. "
+            "Call this mid-session ONLY after explicit user confirmation — e.g. "
+            "user says 'save this', 'write like Didion from now on', 'never do X "
+            "again'. Before calling, ask the user a one-sentence confirmation "
+            "(e.g. 'Save \"<content>\" to your voice profile under <section>?'). "
+            "Idempotent: content already present in the section is a no-op. "
+            "Preserves every other section and the USER_EDITS block. Use for "
+            "small, durable rules and named style references — NOT for long "
+            "prose or one-off preferences. For full profile rewrites, use "
+            "`commit_voice` instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["section", "content"],
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Target H3 section. Must be one of: Typography, "
+                        "Formatting, Length and density, Tone and register, "
+                        "Style references, Hard nos, Voice sample."
+                    ),
+                    "enum": list(VOICE_SECTIONS),
+                },
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "Short directive to append (3-800 chars). "
+                        "One rule or one reference per call."
+                    ),
                 },
             },
         },
@@ -909,6 +1022,21 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             + "\n\n_These voice directives are injected every session. They are "
             "binding: respect the nevers/preferences/style unless the user overrides "
             "them in-conversation. Call `get_voice` to re-read them verbatim._"
+            + "\n\n## Capturing new voice signals mid-session\n\n"
+            "When the user signals a durable voice preference in-session — "
+            "statements like `save this`, `remember this`, `write like Didion "
+            "from now on`, `never do X again`, or explicitly names an author "
+            "or piece as a style target — capture it by:\n\n"
+            "1. Asking a one-sentence confirmation: `Save \"<short paraphrase>\" "
+            "to your voice profile under <section>?` Do not paraphrase rules "
+            "the user has not stated.\n"
+            "2. On yes, call `append_to_voice(section=..., content=...)`. "
+            "Sections: Typography, Formatting, Length and density, Tone and "
+            "register, Style references, Hard nos, Voice sample.\n"
+            "3. On no or silence, drop it. Never persist without confirmation.\n\n"
+            "Style references grow this way over time. Past chats seeded the "
+            "initial profile; future chats refine it. The user never hand-edits "
+            "voice.md above the USER_EDITS sentinel."
         )
     else:
         instructions += (
@@ -922,32 +1050,46 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "## Procedure\n\n"
             "1. **Gather evidence via semantic retrieval.** `ask_minion` with "
             "`mode='relevance'` is an NLP semantic search over the user's own "
-            "utterances (MiniLM embeddings over ~22k chunks). Trust it. Query "
-            "in the *shape of the answer*, not the shape of the question. "
-            "Users don't narrate their preferences (`I want responses "
-            "formatted as...`); they state imperatives (`no emojis`, `be "
-            "direct`). Phrase your queries as hypothetical user utterances. "
+            "utterances (MiniLM embeddings). Trust it. Query in the *shape of "
+            "the answer*, not the shape of the question. Users don't narrate "
+            "their preferences (`I want responses formatted as...`); they "
+            "state imperatives (`no emojis`, `write like me`, `cut the "
+            "words`). Phrase your queries as hypothetical user utterances. "
             "Always filter `role='user'` so you see only the user's own "
-            "directives, not assistant replies. 3-5 queries is the right "
-            "budget. Good seeds:\n\n"
+            "directives, not assistant replies. 6-8 queries is the right "
+            "budget, one per dimension. These eight seeds were tuned against "
+            "this corpus (mean top-hit score 0.66 on a 22k-chunk index) and "
+            "each probes a distinct axis:\n\n"
             "```\n"
             "ask_minion(query=\"don't use emojis, em dashes, or ellipses in your responses\",\n"
-            "           mode='relevance', role='user', top_k=12)\n"
+            "           mode='relevance', role='user', top_k=12)  # typography\n"
             "ask_minion(query=\"respond in short paragraphs, no bullet points or headers\",\n"
-            "           mode='relevance', role='user', top_k=12)\n"
-            "ask_minion(query=\"be direct, no preamble, no hedging, cut the filler\",\n"
-            "           mode='relevance', role='user', top_k=12)\n"
-            "ask_minion(query=\"write in the voice of a specific author or register\",\n"
-            "           mode='relevance', role='user', top_k=12)\n"
-            "ask_minion(query=\"keep your tone confident and analytical, not apologetic\",\n"
-            "           mode='relevance', role='user', top_k=12)\n"
+            "           mode='relevance', role='user', top_k=12)  # formatting\n"
+            "ask_minion(query=\"keep it short, minimum words, compress this down\",\n"
+            "           mode='relevance', role='user', top_k=12)  # length / density\n"
+            "ask_minion(query=\"shorter sentences, punchier, less wordy\",\n"
+            "           mode='relevance', role='user', top_k=12)  # sentence shape\n"
+            "ask_minion(query=\"this sounds like an AI wrote it, rewrite in a human voice\",\n"
+            "           mode='relevance', role='user', top_k=12)  # voice / register\n"
+            "ask_minion(query=\"I love how this writer writes, capture that voice\",\n"
+            "           mode='relevance', role='user', top_k=12)  # style references (self)\n"
+            "ask_minion(query=\"write like Hemingway, Didion, Paul Graham, or a specific author I named\",\n"
+            "           mode='relevance', role='user', top_k=12)  # style references (external)\n"
+            "ask_minion(query=\"more casual, less formal, how I would say it to a friend\",\n"
+            "           mode='relevance', role='user', top_k=12)  # formality\n"
             "```\n\n"
+            "   Sources grow over time: style references come from the user's "
+            "past ChatGPT/Claude chats already in the index, plus future Claude "
+            "sessions once those get ingested. You never ask the user to hand-"
+            "maintain a list. You infer from what the index contains.\n\n"
             "   Supplement with `browse_conversations(limit=15, order='newest')` "
-            "for recent work context. Use `conversation_chunks(...)` to pull a "
-            "whole thread only if a single hit needs more context. Reserve "
-            "`mode='keyword'` for one narrow job: if a style reference surfaces "
-            "(a name like `Paul Graham`, `Hemingway`), follow up with "
-            "`mode='keyword'` to find all occurrences of that specific token. "
+            "for recent work context if the semantic hits feel sparse. Use "
+            "`conversation_chunks(...)` to pull a whole thread only if a single "
+            "hit needs more context.\n\n"
+            "   Reserve `mode='keyword'` for one narrow job: if a specific "
+            "author or work name surfaces in the semantic hits (e.g. `Paul "
+            "Graham`, `Hemingway`, a book title), follow up with "
+            "`mode='keyword'` on that exact token to find every occurrence. "
             "Do not use keyword mode as a semantic fallback.\n\n"
             "2. **Synthesize** a short, binding voice profile in Markdown. "
             "Use these exact H3 headings; mark any section without support "
@@ -986,7 +1128,17 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "`voice.md` below the USER_EDITS sentinel afterward.\n"
             "- After `commit_voice` returns `status=ok`, proceed with the "
             "user's actual question and apply the voice you just synthesized "
-            "from here onward in the conversation."
+            "from here onward in the conversation.\n\n"
+            "## Future signals (after this bootstrap)\n\n"
+            "Once the profile is committed, it grows incrementally. When the "
+            "user signals a durable voice preference in any future session — "
+            "`save this`, `write like Didion from now on`, `never do X again`, "
+            "or explicitly names an author or piece as a style target — ask a "
+            "one-sentence confirmation and then call `append_to_voice` to "
+            "persist it. Do not persist without explicit user confirmation. "
+            "The user never hand-maintains style references; they come from "
+            "past chats (via this bootstrap) and future chats (via "
+            "`append_to_voice`)."
         )
 
     if _load_profile_brief() is not None:
@@ -1017,6 +1169,7 @@ _DISPATCH = {
     "get_chunk": _tool_get_chunk,
     "get_voice": _tool_get_voice,
     "commit_voice": _tool_commit_voice,
+    "append_to_voice": _tool_append_to_voice,
     "browse_conversations": _tool_browse_conversations,
     "conversation_chunks": _tool_conversation_chunks,
     "list_sources": _tool_list_sources,
