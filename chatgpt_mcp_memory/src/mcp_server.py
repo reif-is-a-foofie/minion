@@ -70,7 +70,16 @@ _INSTRUCTIONS_FALLBACK = (
     "you find. Start with mode='relevance'; if hits feel weak or miss a "
     "specific name, retry in mode='keyword' (scans OCR with noise and "
     "embeddings underrank rare proper nouns). Use mode='oldest' or "
-    "mode='newest' for first/last/time-scoped questions."
+    "mode='newest' for first/last/time-scoped questions.\n\n"
+    "CRITICAL — index location: all retrieval reads the SQLite DB under "
+    "$MINION_DATA_DIR (and drops land in $MINION_INBOX). If the user just "
+    "ingested a file in the Minion app but you see no hits, the MCP process "
+    "is almost certainly using a different data directory than the running "
+    "app (common with hand-edited Cursor/Claude MCP configs). Ask them to "
+    "open Minion → Settings and copy MINION_DATA_DIR / MINION_INBOX from "
+    "there into their MCP server env, then restart the IDE. One line on "
+    "stderr when this server starts logs the resolved path and chunk counts "
+    "for debugging."
 )
 
 log = logging.getLogger("minion.mcp")
@@ -241,6 +250,7 @@ _INDEX_LOCK = threading.RLock()  # reentrant: _get_model acquires then calls _ge
 _CONN: Optional[sqlite3.Connection] = None
 _MODEL: Optional[TextEmbedding] = None
 _MODEL_NAME: Optional[str] = None
+_MCP_STARTUP_LOGGED: bool = False
 
 _SESSION_STATE: Dict[str, Any] = {"brief_sent": False}
 
@@ -263,7 +273,7 @@ def _maybe_auto_migrate(data_dir: Path) -> None:
 
 
 def _get_conn() -> sqlite3.Connection:
-    global _CONN
+    global _CONN, _MCP_STARTUP_LOGGED
     with _INDEX_LOCK:
         if _CONN is not None:
             return _CONN
@@ -273,6 +283,19 @@ def _get_conn() -> sqlite3.Connection:
         telemetry.configure(data_dir)
         db_path = data_dir / DB_FILENAME
         _CONN = connect(db_path)
+        if not _MCP_STARTUP_LOGGED:
+            _MCP_STARTUP_LOGGED = True
+            try:
+                ns = count_sources(_CONN)
+                nc = count_chunks(_CONN)
+                print(
+                    f"[minion-mcp] MINION_DATA_DIR={data_dir} "
+                    f"sources={ns} chunks={nc} db={db_path.name}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                log.exception("minion-mcp startup stats")
         _maybe_start_watcher(db_path)
         return _CONN
 

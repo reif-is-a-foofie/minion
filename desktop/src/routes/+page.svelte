@@ -146,6 +146,27 @@
   async function openSettings() {
     showSettings = true;
     if (!settingsLoaded) await loadSettings();
+    try {
+      await refreshStatus();
+    } catch {
+      /* sidecar may be offline */
+    }
+  }
+
+  let copyHint = $state<string | null>(null);
+  let copyHintTimer: ReturnType<typeof setTimeout> | null = null;
+  async function copyToClipboard(label: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copyHint = `${label} copied`;
+    } catch {
+      copyHint = "Copy failed";
+    }
+    if (copyHintTimer) clearTimeout(copyHintTimer);
+    copyHintTimer = setTimeout(() => {
+      copyHint = null;
+      copyHintTimer = null;
+    }, 2000);
   }
 
   const KIND_LABELS: Record<string, string> = {
@@ -890,6 +911,32 @@
             {connecting ? "connecting…" : "Connect"}
           </button>
         </div>
+        {#if status}
+          <div class="setting-row path-row">
+            <div class="setting-main">
+              <div class="setting-label">Memory index (MCP)</div>
+              <div class="setting-desc path-hint">
+                Claude, Cursor, and other MCP clients must set
+                <code>MINION_DATA_DIR</code> and <code>MINION_INBOX</code> to these paths
+                or searches will miss files the app just ingested. Use Connect above for
+                Claude Desktop; for Cursor, mirror the same <code>env</code> block.
+              </div>
+              <pre class="path-block">{status.data_dir}</pre>
+              <div class="path-actions">
+                <button type="button" class="ghost tiny" onclick={() => copyToClipboard("Data dir", status!.data_dir)}>
+                  Copy data dir
+                </button>
+                <button type="button" class="ghost tiny" onclick={() => copyToClipboard("Inbox", status!.inbox)}>
+                  Copy inbox
+                </button>
+              </div>
+              <pre class="path-block">{status.inbox}</pre>
+              {#if copyHint}
+                <div class="copy-toast">{copyHint}</div>
+              {/if}
+            </div>
+          </div>
+        {/if}
       </div>
 
       <div class="modal-section settings-section">
@@ -1881,6 +1928,45 @@
     margin-bottom: 8px;
   }
   .setting-row:last-child { margin-bottom: 0; }
+  .setting-row.path-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .setting-row.path-row .setting-main {
+    width: 100%;
+  }
+  .path-hint code {
+    font-family: var(--mono-font);
+    font-size: 11px;
+  }
+  .path-block {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--mono-font);
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .path-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+  button.ghost.tiny {
+    font-size: 11px;
+    padding: 4px 10px;
+  }
+  .copy-toast {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--accent-2);
+  }
   .setting-main { min-width: 0; flex: 1; }
   .setting-label {
     font-family: var(--ui-font);

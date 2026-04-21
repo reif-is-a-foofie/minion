@@ -873,6 +873,7 @@ def _build_mcp_entry() -> Dict[str, Any]:
         "args": [str(mcp_script)],
         "env": {
             "MINION_DATA_DIR": str(State.data_dir),
+            "MINION_INBOX": str(State.inbox),
             "MINION_BUILD_SHA": _mcp_build_sha(),
         },
     }
