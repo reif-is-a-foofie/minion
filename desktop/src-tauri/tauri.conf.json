@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Minion",
-  "version": "0.2.2",
-  "identifier": "dev.minion.app",
+  "version": "0.3.0",
+  "identifier": "dev.minion",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash src-tauri/scripts/sync_sidecar.sh && npm run build",
+    "beforeBuildCommand": "bash src-tauri/scripts/sync_sidecar.sh && bun run build",
     "frontendDist": "../build"
   },
   "app": {
@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -941,6 +941,12 @@ def connect_claude_desktop(body: ConnectBody) -> Dict[str, Any]:
         result = _upsert_mcp_entry(cfg_path, body.server_name, create_if_missing=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except OSError as e:
+        detail = f"cannot write {cfg_path}: {e.strerror or 'os error'}"
+        raise HTTPException(status_code=403, detail=detail)
+    except Exception as e:
+        # Avoid leaking stack traces into the UI; keep it actionable.
+        raise HTTPException(status_code=500, detail=f"connect failed: {e.__class__.__name__}: {e}")
 
     return {
         "config_path": result["config_path"],

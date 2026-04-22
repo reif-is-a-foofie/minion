@@ -92,7 +92,29 @@
       const res = await connectClaudeDesktop({});
       connectMsg = `Added to ${res.config_path.split("/").pop()}. Restart Claude Desktop to load.`;
     } catch (e) {
-      connectMsg = `Failed: ${(e as Error).message}`;
+      const msg = (e as Error).message ?? String(e);
+      // If the sidecar can't write the default path (common on locked-down setups),
+      // fall back to a user-picked config file path and retry once.
+      if (msg.includes("403") || msg.toLowerCase().includes("permission") || msg.toLowerCase().includes("cannot write")) {
+        try {
+          const picked = await openDialog({
+            title: "Select claude_desktop_config.json",
+            multiple: false,
+            directory: false,
+            filters: [{ name: "JSON", extensions: ["json"] }],
+          });
+          if (typeof picked === "string" && picked) {
+            const res = await connectClaudeDesktop({ config_path: picked });
+            connectMsg = `Added to ${res.config_path.split("/").pop()}. Restart Claude Desktop to load.`;
+          } else {
+            connectMsg = `Failed: ${msg}`;
+          }
+        } catch (e2) {
+          connectMsg = `Failed: ${msg}`;
+        }
+      } else {
+        connectMsg = `Failed: ${msg}`;
+      }
     } finally {
       connecting = false;
     }
