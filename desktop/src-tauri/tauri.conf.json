@@ -41,6 +41,15 @@
     ],
     "resources": {
       "resources/sidecar": "sidecar"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI1Q0JEMjhEQjlDN0RDQTAKUldTZzNNZTVqZExMSlcvYTd5Z2tFYVJNNDRnU3Q4dVQwWEpaT0xUOXQ0bVJ6L0pEUVNhNnI5dVEK",
+      "endpoints": [
+        "https://github.com/reif-is-a-foofie/Minion/releases/latest/download/latest.json"
+      ]
     }
   }
 }

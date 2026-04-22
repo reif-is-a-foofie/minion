@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
   import {
     connectClaudeDesktop,
     copyIntoInbox,
@@ -103,6 +103,7 @@
   let analyticsOptIn = $state(false);
   /** From GET /capabilities — whether the sidecar has MINION_ANALYTICS_URL set. */
   let analyticsUrlConfigured = $state(false);
+  let updaterBusy = $state(false);
 
   let supportAbout = $state<DiagnosticsAbout | null>(null);
   let supportPeers = $state<DiagnosticsPeersResponse | null>(null);
@@ -205,6 +206,48 @@
       pushFeed("settings", "copied redacted sidecar log");
     } catch (e) {
       pushFeed("settings", `copy failed: ${(e as Error).message}`);
+    }
+  }
+
+  /** Tauri signed updater (GitHub `latest.json`). Throttled unless `force`. */
+  async function maybeCheckForAppUpdate(force: boolean) {
+    if (import.meta.env.DEV) return;
+    if (updaterBusy) return;
+    const key = "minion_last_update_check";
+    if (!force) {
+      const last = Number(localStorage.getItem(key) || "0");
+      if (Date.now() - last < 12 * 3600 * 1000) return;
+    }
+    updaterBusy = true;
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      const update = await check({ timeout: 45_000 });
+      if (!update) {
+        if (force) pushFeed("settings", "Minion is up to date");
+        localStorage.setItem(key, String(Date.now()));
+        return;
+      }
+      const go = await ask(
+        `Minion ${update.version} is available.${update.body ? `\n\n${update.body}` : ""}\n\nDownload and install now? (macOS may ask for permission.)`,
+        { title: "Update available", kind: "info" },
+      );
+      if (!go) {
+        localStorage.setItem(key, String(Date.now()));
+        return;
+      }
+      await update.downloadAndInstall((ev) => {
+        if (ev.event === "Started") {
+          pushFeed("settings", "Downloading update…");
+        }
+      });
+      pushFeed("settings", "Installing… app will restart.");
+      await relaunch();
+    } catch (e) {
+      if (force) pushFeed("settings", `Update check failed: ${(e as Error).message}`);
+    } finally {
+      updaterBusy = false;
+      localStorage.setItem(key, String(Date.now()));
     }
   }
 
@@ -1031,6 +1074,29 @@
     if (supportStreamLines.length) return supportStreamLines.slice(-240);
     return supportSnapshotLines.slice(-240);
   });
+
+  /** Production-only background update check once the websocket is up. */
+  let updaterAutoTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    if (import.meta.env.DEV || conn !== "open") {
+      if (updaterAutoTimer !== null) {
+        clearTimeout(updaterAutoTimer);
+        updaterAutoTimer = null;
+      }
+      return;
+    }
+    if (updaterAutoTimer !== null) return;
+    updaterAutoTimer = setTimeout(() => {
+      updaterAutoTimer = null;
+      void maybeCheckForAppUpdate(false);
+    }, 18_000);
+    return () => {
+      if (updaterAutoTimer !== null) {
+        clearTimeout(updaterAutoTimer);
+        updaterAutoTimer = null;
+      }
+    };
+  });
 </script>
 
 <svelte:head>
@@ -1507,6 +1573,18 @@
                     that env on the sidecar process; users then opt in here.
                   </p>
                 {/if}
+
+                <div class="section-title small support-mt">App updates</div>
+                <p class="setting-desc">
+                  Release builds check GitHub for a signed <span class="mono">latest.json</span> (see
+                  <span class="mono">desktop/scripts/write_latest_json.py</span>). You stay on the stable channel unless you change the
+                  updater endpoints in <span class="mono">tauri.conf.json</span>.
+                </p>
+                <div class="support-actions">
+                  <button type="button" class="ghost" onclick={() => void maybeCheckForAppUpdate(true)} disabled={updaterBusy}>
+                    {updaterBusy ? "Checking…" : "Check for updates now"}
+                  </button>
+                </div>
 
                 <div class="section-title small support-mt">Comms hub — local instances</div>
                 <p class="setting-desc">

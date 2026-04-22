@@ -106,6 +106,47 @@ bundle the sidecar (PyInstaller) — see `TODO(sidecar-bundle)` in
 `src-tauri/src/lib.rs`. Until then, the packaged app still needs a repo
 checkout + venv.
 
+## Automatic updates (Tauri updater)
+
+Signed updates use **`tauri-plugin-updater`**. The app reads
+`https://github.com/reif-is-a-foofie/Minion/releases/latest/download/latest.json`
+(see `src-tauri/tauri.conf.json` → `plugins.updater`).
+
+1. **Signing key** — generate once (`CI=1 npx tauri signer generate --ci -p "" -w src-tauri/updater/minion.key`).
+   Put **`minion.key` in `.gitignore`** (already ignored) and store the same key in
+   GitHub Actions as `TAURI_SIGNING_PRIVATE_KEY` (or `TAURI_SIGNING_PRIVATE_KEY_PATH`).
+   Paste the **`.pub` contents** into `tauri.conf.json` → `plugins.updater.pubkey`
+   (must match the private key used at build time).
+
+2. **Build** — with the private key in the environment:
+
+   ```bash
+   export TAURI_SIGNING_PRIVATE_KEY_PATH="$PWD/src-tauri/updater/minion.key"
+   npm run tauri build -- --target aarch64-apple-darwin
+   npm run tauri build -- --target x86_64-apple-darwin
+   ```
+
+   Each build emits `Minion.app.tar.gz` and `.sig` under `src-tauri/target/.../bundle/macos/`.
+
+3. **Publish** — upload both tarballs to a GitHub Release, then generate **`latest.json`**:
+
+   ```bash
+   python3 scripts/write_latest_json.py \
+     --version 1.0.2 \
+     --notes "…" \
+     --darwin-aarch64-url "https://github.com/…/Minion_1.0.2_aarch64.app.tar.gz" \
+     --darwin-aarch64-sig path/to/Minion_1.0.2_aarch64.app.tar.gz.sig \
+     --darwin-x86_64-url "https://github.com/…/Minion_1.0.2_x64.app.tar.gz" \
+     --darwin-x86_64-sig path/to/Minion_1.0.2_x64.app.tar.gz.sig \
+     > latest.json
+   ```
+
+   Attach **`latest.json`** to the release as `latest.json` so the
+   `releases/latest/download/latest.json` URL resolves.
+
+Release builds prompt in **Settings → Support → Check for updates**; a
+background check also runs ~18s after the app connects (production only).
+
 ## Connect any MCP client
 
 The **Connect Claude Desktop** button merges Minion into

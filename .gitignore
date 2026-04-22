@@ -33,6 +33,9 @@ __pycache__/
 # Local / pre-production experiments (not shipped; see docs/wip/ for saved drafts)
 experimental/
 
+# Tauri updater private key (never commit; use GitHub Actions secret TAURI_SIGNING_PRIVATE_KEY or *_PATH)
+desktop/src-tauri/updater/minion.key
+
 # Desktop app (Tauri + SvelteKit)
 desktop/node_modules/
 desktop/.svelte-kit/
