@@ -39,6 +39,8 @@ from store import (
     search as store_search,
 )
 import telemetry
+import identity
+from retrieval_bias import apply_identity_rerank, rrf_fuse
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
     USER_EDITS_SENTINEL,
@@ -206,6 +208,29 @@ def _voice_is_built() -> bool:
         return False
 
 
+def _merge_identity_into_brief(base: str, cap: int) -> str:
+    db_path = _data_dir() / DB_FILENAME
+    extra = ""
+    if db_path.is_file():
+        try:
+            c = connect(db_path)
+            try:
+                extra = identity.build_identity_summary(
+                    c, max_claims=25, max_clusters=5
+                ).strip()
+            finally:
+                c.close()
+        except Exception:
+            extra = ""
+    merged = base
+    if extra:
+        merged = base.rstrip() + "\n\n---\n\n" + extra
+    merged = merged.strip()
+    if len(merged) > cap:
+        merged = merged[: cap - 30].rstrip() + "\n\n_…truncated…_\n"
+    return merged
+
+
 def _load_profile_brief() -> Optional[str]:
     explicit = _env_first("MINION_PROFILE")
     candidates: List[Path] = []
@@ -226,9 +251,7 @@ def _load_profile_brief() -> Optional[str]:
             continue
         if not text:
             continue
-        if len(text) > cap:
-            text = text[: cap - 30].rstrip() + "\n\n_…truncated…_\n"
-        return text
+        return _merge_identity_into_brief(text, cap)
     return None
 
 
@@ -343,12 +366,6 @@ def _cap_text(text: str, max_chars: int) -> str:
 
 _VALID_MODES = ("relevance", "oldest", "newest", "keyword")
 
-# RRF fusion constant. 60 is the canonical value from Cormack et al. 2009;
-# tuning it above ~30 makes the fused ranks robust to score-scale differences
-# between semantic cosine and FTS5 BM25.
-_RRF_K = 60
-
-
 def _content_fingerprint(text: str) -> str:
     """Cheap hash of the first ~400 meaningful chars.
 
@@ -361,41 +378,6 @@ def _content_fingerprint(text: str) -> str:
     # Normalize whitespace + case so "  foo\n BAR " == "foo bar".
     norm = " ".join((text or "").split()).lower()[:400]
     return hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()
-
-
-def _rrf_fuse(
-    relevance_hits: List[Any],
-    keyword_hits: List[Any],
-    *,
-    k: int = _RRF_K,
-    semantic_weight: float = 1.5,
-) -> List[Any]:
-    """Weighted Reciprocal Rank Fusion of two hit lists by chunk_id.
-
-    score(c) = w_sem / (k + rank_sem(c)) + 1 / (k + rank_kw(c))
-
-    Semantic gets a 1.5x weight because FTS5 with implicit-AND across
-    common tokens surfaces noise (e.g. a query with "location" will match
-    unrelated chunks that happen to contain "location"). Weighting
-    semantic higher means keyword acts as a nudge for rare proper nouns
-    without hijacking queries where semantic already nailed it.
-
-    Only fuse ranks; preserve each hit's original score on the returned
-    object so the caller can display a faithful cosine (or BM25-derived)
-    number rather than an opaque fused metric.
-    """
-    scores: Dict[str, float] = {}
-    kept: Dict[str, Any] = {}
-    for rank, h in enumerate(relevance_hits, start=1):
-        cid = h.chunk_id
-        scores[cid] = scores.get(cid, 0.0) + semantic_weight / (k + rank)
-        kept[cid] = h  # relevance copy wins (carries cosine score)
-    for rank, h in enumerate(keyword_hits, start=1):
-        cid = h.chunk_id
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
-        kept.setdefault(cid, h)
-    fused = sorted(kept.values(), key=lambda h: scores[h.chunk_id], reverse=True)
-    return fused
 
 
 def _file_url(path: Optional[str]) -> Optional[str]:
@@ -522,13 +504,19 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
                     after=after_f,
                 )
                 if keyword_hits:
-                    hits = _rrf_fuse(relevance_hits, keyword_hits)
+                    hits = rrf_fuse(relevance_hits, keyword_hits)
                     rerank_used = "rrf"
             except Exception:
                 log.exception("RRF fusion failed; falling back to relevance-only")
         # Bookkeeping for telemetry below.
         _SESSION_STATE["_last_rerank"] = rerank_used
         _SESSION_STATE["_last_candidates"] = len(relevance_hits)
+
+    if mode in ("relevance", "keyword") and hits:
+        hits, bias_meta = apply_identity_rerank(conn, hits)
+        _SESSION_STATE["_bias_meta"] = bias_meta
+    else:
+        _SESSION_STATE["_bias_meta"] = {}
 
     results: List[Dict[str, Any]] = []
     seen_sources: set[str] = set()
@@ -556,6 +544,7 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
     # spotted by tailing the JSONL. Never blocks or raises.
     try:
         top = results[0] if results else {}
+        bias_meta = _SESSION_STATE.pop("_bias_meta", None) or {}
         telemetry.log_event(
             "search",
             mode=mode,
@@ -572,6 +561,10 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
             kind_filter=kind,
             path_glob=path_glob,
             role=role,
+            bias_clusters=bias_meta.get("bias_clusters"),
+            bias_claims=bias_meta.get("bias_claims"),
+            bias_run_at=bias_meta.get("bias_run_at"),
+            adjustments_applied=bias_meta.get("adjustments_applied"),
         )
     except Exception:
         pass
@@ -842,6 +835,48 @@ def _tool_index_info(_: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tool_propose_identity_update(args: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _get_conn()
+    payload, err = identity.propose_identity_update(
+        conn,
+        kind=str(args.get("kind") or ""),
+        text=str(args.get("text") or ""),
+        source_agent=args.get("source_agent"),
+        confidence=args.get("confidence"),
+        evidence_chunk_ids=args.get("evidence_chunk_ids"),
+        evidence_rationales=args.get("evidence_rationales"),
+        meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
+    )
+    if err:
+        return {"status": "error", "error": err}
+    assert payload is not None
+    return {"status": "ok", **payload}
+
+
+def _tool_list_identity_claims(args: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _get_conn()
+    limit = args.get("limit")
+    try:
+        lim = int(limit) if limit is not None else 100
+    except (TypeError, ValueError):
+        lim = 100
+    rows, err = identity.list_claims(
+        conn,
+        status=args.get("status"),
+        kind=args.get("kind"),
+        limit=lim,
+    )
+    if err:
+        return {"status": "error", "error": err}
+    return {"status": "ok", "claims": rows, "count": len(rows)}
+
+
+def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _get_conn()
+    md = identity.build_identity_summary(conn)
+    return {"status": "ok", "markdown": md}
+
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "ask_minion",
@@ -1081,6 +1116,55 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "propose_identity_update",
+        "title": "Propose a structured identity claim",
+        "description": (
+            "Append a candidate identity claim with optional evidence chunk_ids from "
+            "`ask_minion` hits. Status starts as proposed; the user approves in the Minion app."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["kind", "text"],
+            "properties": {
+                "kind": {"type": "string", "enum": sorted(identity.CLAIM_KINDS)},
+                "text": {"type": "string"},
+                "source_agent": {"type": ["string", "null"]},
+                "confidence": {"type": ["number", "null"]},
+                "evidence_chunk_ids": {"type": "array", "items": {"type": "string"}},
+                "evidence_rationales": {
+                    "type": "array",
+                    "items": {"type": ["string", "null"]},
+                },
+                "meta": {"type": "object", "additionalProperties": True},
+            },
+        },
+    },
+    {
+        "name": "list_identity_claims",
+        "title": "List identity claims",
+        "description": "Filter by status and/or kind. Use status='proposed' for the review queue.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["proposed", "active", "rejected", "superseded"],
+                    "description": "Omit to list all statuses.",
+                },
+                "kind": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+        },
+    },
+    {
+        "name": "get_identity_summary",
+        "title": "Identity summary (markdown)",
+        "description": "Digest of active claims, pending proposals, and latest preference clusters.",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
         "name": "index_info",
         "title": "Index metadata",
         "description": "Return aggregate metadata about the loaded local index.",
@@ -1291,6 +1375,13 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "condensed user brief (observed patterns from chat history) under "
             "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
         )
+    instructions += (
+        "\n\n## Digital identity graph\n\n"
+        "Structured claims (preferences, values, relationships, goals, boundaries, facts) "
+        "can be stored with evidence from `ask_minion` chunk_ids. Use `propose_identity_update`; "
+        "claims stay `proposed` until the user accepts them in the Minion desktop app. "
+        "`list_identity_claims` and `get_identity_summary` surface the queue and a markdown digest."
+    )
     return _jsonrpc_result(
         req_id,
         {
@@ -1317,6 +1408,9 @@ _DISPATCH = {
     "conversation_chunks": _tool_conversation_chunks,
     "list_sources": _tool_list_sources,
     "index_info": _tool_index_info,
+    "propose_identity_update": _tool_propose_identity_update,
+    "list_identity_claims": _tool_list_identity_claims,
+    "get_identity_summary": _tool_get_identity_summary,
 }
 
 

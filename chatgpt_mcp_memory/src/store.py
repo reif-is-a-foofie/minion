@@ -125,6 +125,46 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS identity_claims (
+    claim_id      TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    text          TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'proposed',
+    confidence    REAL,
+    source_agent  TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    superseded_by TEXT,
+    meta_json     TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (superseded_by) REFERENCES identity_claims(claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_claims_status ON identity_claims(status);
+CREATE INDEX IF NOT EXISTS idx_identity_claims_kind ON identity_claims(kind);
+CREATE INDEX IF NOT EXISTS idx_identity_claims_updated ON identity_claims(updated_at);
+
+CREATE TABLE IF NOT EXISTS identity_edges (
+    edge_id     TEXT PRIMARY KEY,
+    claim_id    TEXT NOT NULL REFERENCES identity_claims(claim_id) ON DELETE CASCADE,
+    chunk_id    TEXT REFERENCES chunks(chunk_id) ON DELETE SET NULL,
+    source_id   TEXT REFERENCES sources(source_id) ON DELETE SET NULL,
+    rationale   TEXT,
+    created_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_edges_claim ON identity_edges(claim_id);
+CREATE INDEX IF NOT EXISTS idx_identity_edges_chunk ON identity_edges(chunk_id);
+
+CREATE TABLE IF NOT EXISTS preference_clusters (
+    cluster_id              TEXT PRIMARY KEY,
+    label                   TEXT NOT NULL,
+    summary                 TEXT NOT NULL,
+    member_chunk_ids_json   TEXT NOT NULL,
+    run_at                  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_preference_clusters_run ON preference_clusters(run_at);
 """
 
 
@@ -881,3 +921,212 @@ def iter_source_ids(conn: sqlite3.Connection) -> Iterable[Tuple[str, str, str, f
         "SELECT source_id, path, sha256, mtime FROM sources ORDER BY path"
     ):
         yield row["source_id"], row["path"], row["sha256"], float(row["mtime"])
+
+
+# ---------------------------------------------------------------------------
+# Identity graph + preference clusters
+# ---------------------------------------------------------------------------
+
+
+def _row_identity_claim(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "claim_id": row["claim_id"],
+        "kind": row["kind"],
+        "text": row["text"],
+        "status": row["status"],
+        "confidence": row["confidence"],
+        "source_agent": row["source_agent"],
+        "created_at": float(row["created_at"]),
+        "updated_at": float(row["updated_at"]),
+        "superseded_by": row["superseded_by"],
+        "meta": json.loads(row["meta_json"] or "{}"),
+    }
+
+
+def identity_claim_insert(
+    conn: sqlite3.Connection,
+    *,
+    claim_id: str,
+    kind: str,
+    text: str,
+    status: str = "proposed",
+    confidence: Optional[float] = None,
+    source_agent: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    now = time.time()
+    conn.execute(
+        "INSERT INTO identity_claims(claim_id, kind, text, status, confidence, "
+        "source_agent, created_at, updated_at, superseded_by, meta_json) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        (
+            claim_id,
+            kind,
+            text,
+            status,
+            confidence,
+            source_agent,
+            now,
+            now,
+            json.dumps(meta or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def identity_claim_get(conn: sqlite3.Connection, claim_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT claim_id, kind, text, status, confidence, source_agent, "
+        "created_at, updated_at, superseded_by, meta_json "
+        "FROM identity_claims WHERE claim_id=?",
+        (claim_id,),
+    ).fetchone()
+    return _row_identity_claim(row) if row else None
+
+
+def identity_claim_list(
+    conn: sqlite3.Connection,
+    *,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    sql = (
+        "SELECT claim_id, kind, text, status, confidence, source_agent, "
+        "created_at, updated_at, superseded_by, meta_json "
+        "FROM identity_claims WHERE 1=1"
+    )
+    params: List[Any] = []
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    if kind:
+        sql += " AND kind=?"
+        params.append(kind)
+    sql += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(int(max(1, min(limit, 2000))))
+    return [_row_identity_claim(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def identity_claim_set_status(
+    conn: sqlite3.Connection,
+    claim_id: str,
+    *,
+    status: str,
+    superseded_by: Optional[str] = None,
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM identity_claims WHERE claim_id=?", (claim_id,)
+    ).fetchone()
+    if not row:
+        return False
+    now = time.time()
+    conn.execute(
+        "UPDATE identity_claims SET status=?, updated_at=?, superseded_by=? WHERE claim_id=?",
+        (status, now, superseded_by, claim_id),
+    )
+    return True
+
+
+def identity_edge_insert(
+    conn: sqlite3.Connection,
+    *,
+    edge_id: str,
+    claim_id: str,
+    chunk_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    rationale: Optional[str] = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO identity_edges(edge_id, claim_id, chunk_id, source_id, rationale, created_at) "
+        "VALUES(?, ?, ?, ?, ?, ?)",
+        (edge_id, claim_id, chunk_id, source_id, rationale, time.time()),
+    )
+
+
+def identity_edges_for_claim(conn: sqlite3.Connection, claim_id: str) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT edge_id, claim_id, chunk_id, source_id, rationale, created_at "
+        "FROM identity_edges WHERE claim_id=? ORDER BY created_at",
+        (claim_id,),
+    ).fetchall()
+    return [
+        {
+            "edge_id": r["edge_id"],
+            "claim_id": r["claim_id"],
+            "chunk_id": r["chunk_id"],
+            "source_id": r["source_id"],
+            "rationale": r["rationale"],
+            "created_at": float(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def preference_clusters_clear(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM preference_clusters")
+
+
+def preference_clusters_insert(
+    conn: sqlite3.Connection,
+    *,
+    cluster_id: str,
+    label: str,
+    summary: str,
+    member_chunk_ids: Sequence[str],
+    run_at: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO preference_clusters(cluster_id, label, summary, member_chunk_ids_json, run_at) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (
+            cluster_id,
+            label,
+            summary,
+            json.dumps(list(member_chunk_ids), ensure_ascii=False),
+            float(run_at),
+        ),
+    )
+
+
+def preference_clusters_list(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT cluster_id, label, summary, member_chunk_ids_json, run_at "
+        "FROM preference_clusters ORDER BY run_at DESC, cluster_id"
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "cluster_id": r["cluster_id"],
+                "label": r["label"],
+                "summary": r["summary"],
+                "member_chunk_ids": json.loads(r["member_chunk_ids_json"] or "[]"),
+                "run_at": float(r["run_at"]),
+            }
+        )
+    return out
+
+
+def iter_chunk_embedding_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> List[Tuple[str, str, np.ndarray]]:
+    """Return (chunk_id, text, embedding_vector) for up to `limit` chunks with vectors."""
+    rows = conn.execute(
+        "SELECT c.chunk_id, c.text, v.embedding AS emb "
+        "FROM chunks c JOIN vec_chunks v ON v.rowid = c.rowid "
+        "ORDER BY RANDOM() LIMIT ?",
+        (int(max(1, limit)),),
+    ).fetchall()
+    out: List[Tuple[str, str, np.ndarray]] = []
+    dim = get_embed_dim(conn)
+    for r in rows:
+        blob = r["emb"]
+        if blob is None:
+            continue
+        vec = np.frombuffer(blob, dtype=np.float32)
+        if vec.size != dim:
+            continue
+        out.append((str(r["chunk_id"]), str(r["text"]), vec.copy()))
+    return out

@@ -30,6 +30,9 @@ chatgpt_mcp_memory/build/
 chatgpt_mcp_memory/dist/
 __pycache__/
 
+# Local / pre-production experiments (not shipped; see docs/wip/ for saved drafts)
+experimental/
+
 # Desktop app (Tauri + SvelteKit)
 desktop/node_modules/
 desktop/.svelte-kit/

@@ -825,41 +825,52 @@
       <img src="/minion.png" alt="" class="brand-icon" />
       <h1>Minion</h1>
     </div>
-    <div class="counts">
-      {#if status}
-        <span><strong>{status.counts.sources}</strong></span>
-        <span class="watcher" class:live={status.watcher.running}>
-          {status.watcher.running ? "watching" : "paused"}
+    <div class="header-right">
+      <div class="counts">
+        {#if status}
+          <span><strong>{status.counts.sources}</strong></span>
+          <span class="watcher" class:live={status.watcher.running}>
+            {status.watcher.running ? "watching" : "paused"}
+          </span>
+        {/if}
+        <span
+          class="status-pill status-{conn}"
+          title={conn === "open"
+            ? `Sidecar ready · ${config?.api_base ?? ""}${status?.db_path ? `\nDB: ${status.db_path}` : ""}${status?.data_dir ? `\nData: ${status.data_dir}` : ""}`
+            : conn === "connecting"
+              ? "Connecting to sidecar…"
+              : conn === "unreachable"
+                ? "Sidecar unreachable. Check that Python 3.10+ is installed and click Settings → Restart."
+                : "Sidecar restarting…"}
+        >
+          <span class="status-dot"></span>
+          {conn === "open"
+            ? "ready"
+            : conn === "connecting"
+              ? "starting"
+              : conn === "unreachable"
+                ? "offline"
+                : "reconnecting"}
         </span>
+        <button class="ghost" onclick={() => (showContents = true)} title="View indexed sources and search">
+          Contents
+        </button>
+        <button class="ghost" onclick={openIdentity} title="Review identity claims and export">
+          Identity
+        </button>
+        <button class="ghost" onclick={openSettings} title="Server, Claude Desktop, and file-type preferences">
+          Settings
+        </button>
+      </div>
+      {#if conn === "open" && status?.data_dir}
+        <div
+          class="sidecar-data-path"
+          class:mismatch={dataDirMismatch()}
+          title={`Sidecar data: ${status.data_dir}${status.db_path ? `\nDB: ${status.db_path}` : ""}`}
+        >
+          Data: {status.data_dir}
+        </div>
       {/if}
-      <span
-        class="status-pill status-{conn}"
-        title={conn === "open"
-          ? `Sidecar ready · ${config?.api_base ?? ""}${status?.db_path ? `\nDB: ${status.db_path}` : ""}${status?.data_dir ? `\nData: ${status.data_dir}` : ""}`
-          : conn === "connecting"
-            ? "Connecting to sidecar…"
-            : conn === "unreachable"
-              ? "Sidecar unreachable. Check that Python 3.10+ is installed and click Settings → Restart."
-              : "Sidecar restarting…"}
-      >
-        <span class="status-dot"></span>
-        {conn === "open"
-          ? "ready"
-          : conn === "connecting"
-            ? "starting"
-            : conn === "unreachable"
-              ? "offline"
-              : "reconnecting"}
-      </span>
-      <button class="ghost" onclick={() => (showContents = true)} title="View indexed sources and search">
-        Contents
-      </button>
-      <button class="ghost" onclick={openIdentity} title="Review identity claims and export">
-        Identity
-      </button>
-      <button class="ghost" onclick={openSettings} title="Server, Claude Desktop, and file-type preferences">
-        Settings
-      </button>
     </div>
   </header>
 
@@ -1468,6 +1479,26 @@
       filter: drop-shadow(0 2px 4px rgba(16, 34, 56, 0.22))
               drop-shadow(0 0 12px color-mix(in srgb, var(--accent) 50%, transparent));
     }
+  }
+  .header-right {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    min-width: 0;
+  }
+  .sidecar-data-path {
+    max-width: min(520px, 56vw);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--num-font);
+    font-size: 10px;
+    color: var(--muted);
+    line-height: 1.2;
+  }
+  .sidecar-data-path.mismatch {
+    color: #b45309;
   }
   .counts {
     display: flex;

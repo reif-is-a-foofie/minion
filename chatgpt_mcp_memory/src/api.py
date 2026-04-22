@@ -2,8 +2,9 @@
 Minion local HTTP API.
 
 Purpose: give the Tauri desktop app (or any local client) a small, typed
-surface over the same SQLite store + ingest pipeline the MCP uses. No auth —
-binds to 127.0.0.1 only.
+surface over the same SQLite store + ingest pipeline the MCP uses. Binds to
+127.0.0.1 only; optional `MINION_API_TOKEN` enforces Bearer auth on mutating
+routes (see GET /capabilities).
 
 Endpoints:
   GET  /status                      -> counts, inbox path, db path, watcher
@@ -21,6 +22,7 @@ Endpoints:
   POST /identity/clusters/rebuild   -> run embedding clustering job
   POST /identity/export             -> write zip under data_dir/exports/
   GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
+  GET  /capabilities                -> stable feature flags for local agent integrations
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
   WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
@@ -46,9 +48,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ingest import ingest_file, _looks_like_chatgpt_export
@@ -58,6 +60,7 @@ import telemetry
 import identity
 from export_bundle import write_identity_export_zip
 from preference_cluster import run_preference_clustering
+from retrieval_bias import apply_identity_rerank, rrf_fuse
 from store import (
     DB_FILENAME,
     connect,
@@ -65,10 +68,12 @@ from store import (
     count_sources,
     delete_source,
     delete_source_by_path,
+    fts_available,
     get_chunk,
     get_source,
     identity_claim_get,
     identity_edges_for_claim,
+    keyword_search as store_keyword_search,
     list_sources,
     preference_clusters_list,
     search as store_search,
@@ -343,6 +348,21 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _mutation_bearer_auth(request: Request, call_next):
+    """Optional MINION_API_TOKEN: require Bearer on mutating routes (GET stays open)."""
+    tok = os.environ.get("MINION_API_TOKEN", "").strip()
+    if not tok or request.method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+    path = request.url.path
+    if request.method == "POST" and path in ("/search",):
+        return await call_next(request)
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth != f"Bearer {tok}":
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 class SearchBody(BaseModel):
     query: str
     top_k: int = Field(default=8, ge=1, le=20)
@@ -429,6 +449,7 @@ class IdentityExportBody(BaseModel):
 
     out_path: Optional[str] = None
     include_chunk_index: bool = True
+    include_voice_files: bool = True
 
 
 @app.post("/nuke")
@@ -555,6 +576,37 @@ def status() -> Dict[str, Any]:
     }
 
 
+@app.get("/capabilities")
+def capabilities() -> Dict[str, Any]:
+    """Lightweight contract for non-MCP local clients (same host as this API)."""
+    tok_on = bool(os.environ.get("MINION_API_TOKEN", "").strip())
+    return {
+        "service": "minion-api",
+        "version": "0.2.0",
+        "schema_version": 1,
+        "auth": {
+            "mutation_bearer": tok_on,
+            "scheme": "Bearer",
+            "header": "Authorization",
+            "policy": "GET and POST /search require no token; other POST/PUT/PATCH/DELETE require Authorization: Bearer <MINION_API_TOKEN> when set.",
+        },
+        "retrieval": {
+            "identity_bias": True,
+            "rrf_fusion": True,
+        },
+        "endpoints": {
+            "search": "POST /search",
+            "search_stream": "GET /search/stream",
+            "ingest": "POST /ingest",
+            "events_ws": "WS /events",
+            "identity_claims": "GET /identity/claims",
+            "identity_propose": "POST /identity/claims/propose",
+            "identity_export": "POST /identity/export",
+            "clusters_rebuild": "POST /identity/clusters/rebuild",
+        },
+    }
+
+
 @app.get("/sources")
 def list_sources_endpoint(
     kind: Optional[str] = None,
@@ -636,20 +688,42 @@ def _embed_search_results(
     role: Optional[str],
     max_chars: int,
 ) -> List[Dict[str, Any]]:
+    conn = State.conn()
     model = _get_query_model()
     vec = np.asarray(next(iter(model.embed([query]))), dtype=np.float32)
     norm = float(np.linalg.norm(vec))
     if norm > 0:
         vec = vec / norm
-    hits = store_search(
-        State.conn(),
+    internal_k = max(top_k * 3, top_k + 8)
+    relevance_hits = store_search(
+        conn,
         vec,
-        top_k=top_k,
+        top_k=internal_k,
         kind=kind,
         path_glob=path_glob,
         since=since,
         role=role,
     )
+    hits = relevance_hits
+    rerank_used = "none"
+    if query and fts_available(conn):
+        try:
+            keyword_hits = store_keyword_search(
+                conn,
+                query,
+                top_k=internal_k,
+                role=role,
+                kind=kind,
+                path_glob=path_glob,
+            )
+            if keyword_hits:
+                hits = rrf_fuse(relevance_hits, keyword_hits)
+                rerank_used = "rrf"
+        except Exception:
+            log.exception("RRF fusion failed; relevance-only")
+    hits, bias_meta = apply_identity_rerank(conn, hits)
+    hits = hits[:top_k]
+
     results: List[Dict[str, Any]] = []
     for h in hits:
         text = h.text
@@ -668,6 +742,31 @@ def _embed_search_results(
                 "meta": h.meta,
             }
         )
+    try:
+        top = results[0] if results else {}
+        telemetry.log_event(
+            "search",
+            mode="relevance",
+            query=query or None,
+            top_k=top_k,
+            returned=len(results),
+            top_score=top.get("score"),
+            top_path=top.get("path"),
+            top_kind=top.get("kind"),
+            rerank=rerank_used,
+            candidates=len(relevance_hits),
+            content_dropped=None,
+            hit_kinds=[r.get("kind") for r in results],
+            kind_filter=kind,
+            path_glob=path_glob,
+            role=role,
+            bias_clusters=bias_meta.get("bias_clusters"),
+            bias_claims=bias_meta.get("bias_claims"),
+            bias_run_at=bias_meta.get("bias_run_at"),
+            adjustments_applied=bias_meta.get("adjustments_applied"),
+        )
+    except Exception:
+        pass
     return results
 
 
@@ -821,7 +920,9 @@ def identity_export(body: IdentityExportBody) -> Dict[str, Any]:
         meta = write_identity_export_zip(
             State.conn(),
             out_path=out,
+            data_dir=State.data_dir,
             include_chunk_index=body.include_chunk_index,
+            include_voice_files=body.include_voice_files,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")

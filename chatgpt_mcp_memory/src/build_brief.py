@@ -21,6 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import identity
+from store import DB_FILENAME, connect
+
 # --- Preference extraction ---------------------------------------------------
 
 _PREF_VERBS = (
@@ -263,6 +266,20 @@ def build_brief(derived_dir: Path, max_chars: int) -> Path:
     frameworks = _extract_frameworks(all_pairs)
 
     out = _render(n_total, prefs, names, frameworks)
+    db_path = derived_dir / DB_FILENAME
+    if db_path.is_file():
+        try:
+            conn = connect(db_path)
+            try:
+                snap = identity.build_identity_summary(
+                    conn, max_claims=30, max_clusters=6
+                ).strip()
+                if snap:
+                    out = out.rstrip() + "\n\n---\n\n" + snap + "\n"
+            finally:
+                conn.close()
+        except (OSError, ValueError):
+            pass
     out = _cap(out, max_chars)
 
     brief_path = derived_dir / "brief.md"

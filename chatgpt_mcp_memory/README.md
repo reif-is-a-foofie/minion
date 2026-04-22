@@ -72,6 +72,17 @@ python -m pip install --upgrade pip
 pip install -r requirements-all.txt
 ```
 
+### API smoke tests (e2e)
+
+`tests/` spins up a real `api.py` on a random port. **sqlite-vec** needs a Python
+with loadable extension support (Apple’s system Python often fails); use `uv`:
+
+```bash
+uv venv --python 3.12
+uv pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -q
+```
+
 ## 2) Drop files into the inbox (recommended)
 
 The fastest path for arbitrary files is the watched inbox. Minion reconciles

@@ -127,6 +127,19 @@ fn resolve_inbox(data_dir: &Path) -> PathBuf {
     data_dir.join("inbox")
 }
 
+/// `MINION_NEW_API_PORT` — truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
+fn minion_env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn ensure_api_token_file(data_dir: &Path) -> String {
     let p = data_dir.join(".minion_api_token");
     if let Ok(s) = fs::read_to_string(&p) {
@@ -637,6 +650,60 @@ fn listener_is_minion_with_nuke(port: u16) -> bool {
 fn propose_ephemeral_loopback_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     listener.local_addr().ok().map(|a| a.port())
+}
+
+/// Fresh port for a new desktop process when `MINION_API_PORT` is unset.
+/// Ephemeral bind + TCP probe (and lsof when available) avoids joining another
+/// user's listener on the old default `8765`.
+fn allocate_sidecar_port_ephemeral() -> Option<u16> {
+    const ATTEMPTS: u32 = 48;
+    for attempt in 0..ATTEMPTS {
+        let port = propose_ephemeral_loopback_port()?;
+        if find_port_listeners(port).is_empty()
+            && !tcp_port_open("127.0.0.1", port, Duration::from_millis(120))
+        {
+            dbg(
+                "allocate_sidecar_port_ephemeral",
+                serde_json::json!({"picked": port, "attempt": attempt}),
+            );
+            return Some(port);
+        }
+        thread::sleep(Duration::from_millis(8));
+    }
+    None
+}
+
+/// Port the sidecar should bind on for this app instance.
+///
+/// - **`MINION_NEW_API_PORT`** (truthy) — prefer a fresh verified ephemeral
+///   port even if `MINION_API_PORT` is set; on failure fall through to the rules
+///   below (escape hatch when the fixed port is wedged).
+/// - **`MINION_API_PORT` set** — use `resolve_sidecar_port` (reclaim our stale
+///   processes, skip foreign listeners, scan / ephemeral fallback).
+/// - **both unset** — verified-free ephemeral port per launch (shared Mac safe).
+fn resolve_initial_sidecar_port() -> u16 {
+    if minion_env_truthy("MINION_NEW_API_PORT") {
+        if let Some(port) = allocate_sidecar_port_ephemeral() {
+            return port;
+        }
+        dbg(
+            "resolve_initial_sidecar_port",
+            serde_json::json!({"reason": "MINION_NEW_API_PORT_ephemeral_failed_fallback"}),
+        );
+    }
+    if let Ok(raw) = std::env::var("MINION_API_PORT") {
+        if let Ok(preferred) = raw.trim().parse::<u16>() {
+            return resolve_sidecar_port(preferred);
+        }
+    }
+    if let Some(port) = allocate_sidecar_port_ephemeral() {
+        return port;
+    }
+    dbg(
+        "resolve_initial_sidecar_port",
+        serde_json::json!({"reason": "ephemeral_exhausted_fallback_scan"}),
+    );
+    resolve_sidecar_port(8765)
 }
 
 /// Pick a localhost port for the sidecar: prefer `preferred`, but if something
@@ -1469,11 +1536,7 @@ pub fn run() {
     let inbox = resolve_inbox(&data_dir);
     let _ = fs::create_dir_all(&data_dir);
     let _ = fs::create_dir_all(&inbox);
-    let api_port_preferred: u16 = std::env::var("MINION_API_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8765);
-    let api_port = resolve_sidecar_port(api_port_preferred);
+    let api_port = resolve_initial_sidecar_port();
     let api_token = sidecar_api_token(&data_dir);
 
     // Start ollama so the Python sidecar can be spawned with the vision env
