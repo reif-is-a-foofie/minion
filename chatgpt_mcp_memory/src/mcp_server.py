@@ -59,6 +59,10 @@ DEFAULT_MAX_CHARS_FULL = 2000
 PROTOCOL_VERSION = "2025-11-25"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Below this cosine-style top score (relevance mode), retry once with an
+# expanded embedding query and/or attach optional `guidance.try_these_questions`.
+_WEAK_SEMANTIC_SCORE = 0.48
+
 _INSTRUCTIONS_FALLBACK = (
     "Minion is the user's digital identity and long-term memory: their "
     "chat history, notes, documents, scans, photos, voice, video, code, "
@@ -68,10 +72,12 @@ _INSTRUCTIONS_FALLBACK = (
     "whether the answer lives in their experience — history, relationships, "
     "decisions, preferences, work, writing, faith, health, anything tied to "
     "their identity. If so, call `ask_minion` first, then speak from what "
-    "you find. Start with mode='relevance'; if hits feel weak or miss a "
-    "specific name, retry in mode='keyword' (scans OCR with noise and "
-    "embeddings underrank rare proper nouns). Use mode='oldest' or "
-    "mode='newest' for first/last/time-scoped questions.\n\n"
+    "you find. Start with mode='relevance' (default). When "
+    "`structuredContent.guidance` is present, use `try_these_questions`: "
+    "rephrase and call `ask_minion` again yourself — never ask the user "
+    "for path_glob, export names, or modes. If hits miss a rare proper noun, "
+    "retry in mode='keyword'. Use mode='oldest' or mode='newest' for "
+    "first/last/time-scoped questions.\n\n"
     "CRITICAL — index location: all retrieval reads the SQLite DB under "
     "$MINION_DATA_DIR (and drops land in $MINION_INBOX). If the user just "
     "ingested a file in the Minion app but you see no hits, the MCP process "
@@ -474,7 +480,83 @@ def _hit_to_result(hit: Any, max_chars: int) -> Dict[str, Any]:
     }
 
 
-def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _try_these_questions(query: str) -> List[str]:
+    """Human-readable follow-ups for the assistant to paraphrase to the user."""
+    q = query.strip()
+    ql = q.lower()
+    out: List[str] = []
+
+    # Query-specific hooks (keep short; models paraphrase for tone).
+    if any(w in ql for w in ("childhood", "kid", "growing up", "young", "parents")):
+        out.append(
+            "What names, places, or years should I tie to this — family, school, hometown?"
+        )
+    if any(w in ql for w in ("family", "mom", "dad", "sibling", "wife", "husband", "partner")):
+        out.append("Who exactly was involved, and what did I call them in my notes or chats?")
+
+    if q:
+        snippet = q if len(q) <= 120 else q[:117] + "…"
+        out.append(f'Could you search using a more specific phrase I might have written: "{snippet}"?')
+        out.append(
+            "What file, project, trip, or season of my life might this belong to?"
+        )
+    out.extend(
+        [
+            "What exact phrase, name, or title might appear in a chat or uploaded file?",
+            "Was this in voice, a scan, notes, email, or a long ChatGPT thread — "
+            "what do I remember about the format?",
+        ]
+    )
+
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped[:6]
+
+
+def _guidance_for_retrieval(
+    query: str,
+    mode: str,
+    results: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Optional hints for the model; never exposes path_glob or MCP tuning to the user."""
+    if mode in ("oldest", "newest"):
+        return None
+
+    top_score = float(results[0]["score"]) if results else 0.0
+
+    if mode == "keyword":
+        if results:
+            return None
+        confidence = "none"
+    elif mode == "relevance":
+        if results and top_score >= _WEAK_SEMANTIC_SCORE:
+            return None
+        if not results:
+            confidence = "none"
+        elif top_score < 0.32:
+            confidence = "low"
+        else:
+            confidence = "medium"
+    else:
+        return None
+
+    return {
+        "confidence": confidence,
+        "try_these_questions": _try_these_questions(query),
+        "note_for_assistant": (
+            "If these memories look off-topic or thin, acknowledge that lightly. "
+            "Offer try_these_questions in the user's voice — not as a checklist. "
+            "Do not mention path_glob, modes, exports, or other tool parameters; "
+            "adjust the search yourself on the next `ask_minion` call."
+        ),
+    }
+
+
+def _tool_ask_minion(arguments: Dict[str, Any]) -> Dict[str, Any]:
     query = str(arguments.get("query") or "").strip()
     mode = str(arguments.get("mode") or "relevance").lower()
     if mode not in _VALID_MODES:
@@ -545,6 +627,23 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
             since=since_f,
             role=role,
         )
+        best_sem = max((h.score for h in relevance_hits), default=0.0)
+        if query and best_sem < _WEAK_SEMANTIC_SCORE:
+            alt = store_search(
+                conn,
+                _embed_query(
+                    f"{query.strip()} personal history biography memories stories "
+                    "background relationships"
+                ),
+                top_k=internal_k,
+                kind=kind,
+                path_glob=path_glob,
+                since=since_f,
+                role=role,
+            )
+            if max((h.score for h in alt), default=0.0) > best_sem:
+                relevance_hits = alt
+
         # Hybrid rerank: fuse semantic cosine with FTS5 BM25 via Reciprocal
         # Rank Fusion. Fixes the classic failure mode where a short chat turn
         # echoing the query ("ok and how does this fit the patriarchal
@@ -632,7 +731,11 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    return results
+    out: Dict[str, Any] = {"results": results}
+    g = _guidance_for_retrieval(query, mode, results)
+    if g:
+        out["guidance"] = g
+    return out
 
 
 def _tool_get_chunk(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -923,11 +1026,14 @@ TOOLS: List[Dict[str, Any]] = [
             "list chats with `browse_conversations`. For time-scoped "
             "questions (first, earliest, latest, before X, since Y), use "
             "`oldest` or `newest` mode.\n\n"
-            "Dropped files (CSV roster, notes): semantic relevance often ranks "
-            "an older chat that *mentions* the topic above the new file. Use "
-            "list_sources(path_glob='*roster*.csv', since=…) to confirm the "
-            "ingest, then ask_minion with mode=keyword and/or path_glob over "
-            "the source path.\n\n"
+            "Seamless for the user: never expect them to name exports, set "
+            "path_glob, or choose modes. You own that. When the index is weak, "
+            "`structuredContent.guidance` may include `try_these_questions` "
+            "and `note_for_assistant` — paraphrase follow-ups naturally, then "
+            "call `ask_minion` again yourself. Dropped files (CSV rosters, "
+            "notes) can rank below long chats that *mention* the topic: you "
+            "may use list_sources / mode=keyword internally to surface the "
+            "file without teaching the user those knobs.\n\n"
             "When you answer from a Minion hit, name the source briefly so "
             "the user can verify — the document title, file name, or "
             "conversation title from the hit. Link to the source using the "
@@ -968,7 +1074,11 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "path_glob": {
                     "type": ["string", "null"],
-                    "description": "SQL GLOB over source path (e.g. '*/notes/*.md')",
+                    "description": (
+                        "Advanced: SQL GLOB over indexed source path. Users should "
+                        "not need this; narrow on the assistant side unless the "
+                        "user explicitly points at a file or folder."
+                    ),
                 },
                 "since": {
                     "type": ["number", "null"],
