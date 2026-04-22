@@ -6,6 +6,7 @@
     connectClaudeDesktop,
     copyIntoInbox,
     deleteSource,
+    nukeDb,
     fetchSettings,
     fetchSources,
     fetchStatus,
@@ -82,6 +83,25 @@
     } finally {
       // WS will auto-reconnect; watch for the next "open" before clearing.
       setTimeout(() => (restarting = false), 1500);
+    }
+  }
+
+  async function runNukeDb() {
+    const ok = confirm(
+      "This will DELETE Minion's local memory database (memory.db) and telemetry, and you will lose all indexed content. Continue?",
+    );
+    if (!ok) return;
+    pushFeed("settings", "nuking database…");
+    try {
+      const res = await nukeDb();
+      pushFeed("settings", `db wiped: ${res.db_path.split("/").pop()}`);
+      // Restart sidecar so it recreates the DB cleanly and reconnects watchers.
+      await handleRestart();
+      // Refresh UI state after restart.
+      status = await fetchStatus();
+      await refreshSources();
+    } catch (e: any) {
+      pushFeed("settings", `db wipe failed: ${e?.message ?? e}`);
     }
   }
 
@@ -755,6 +775,21 @@
             title="Add Minion to Claude Desktop's mcpServers"
           >
             {connecting ? "connecting…" : "Connect"}
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-section settings-section">
+        <div class="section-title small">Danger zone</div>
+        <div class="setting-row">
+          <div class="setting-main">
+            <div class="setting-label">Nuke local database</div>
+            <div class="setting-desc">
+              Deletes <span class="mono">memory.db</span> (your indexed memory) and resets Minion to a clean slate.
+            </div>
+          </div>
+          <button class="ghost danger" onclick={runNukeDb} title="Delete memory.db and restart the sidecar">
+            Nuke DB
           </button>
         </div>
       </div>

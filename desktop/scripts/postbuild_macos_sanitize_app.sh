@@ -32,5 +32,35 @@ chflags -R nouchg "$app_path" 2>/dev/null || true
 # Make sure the bundle is readable/traversable.
 chmod -R u+rwX,go+rX "$app_path" 2>/dev/null || true
 
+# Guardrail: refuse to ship obvious user data if it somehow got copied in.
+python3 - "$app_path" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+app = Path(sys.argv[1]).resolve()
+bad = []
+needles = {
+    "memory.db",
+    "telemetry.jsonl",
+    "settings.json",
+    "inbox",
+}
+for root, dirs, files in os.walk(app):
+    rp = Path(root)
+    name = rp.name
+    if name in needles:
+        bad.append(str(rp))
+    for f in files:
+        if f in needles or f.endswith((".db", ".sqlite", ".sqlite3")):
+            bad.append(str(rp / f))
+
+if bad:
+    print("ERROR: app bundle appears to include user data files:", file=sys.stderr)
+    for p in sorted(set(bad))[:200]:
+        print(f"  - {p}", file=sys.stderr)
+    sys.exit(3)
+PY
+
 echo "sanitized: $app_path"
 

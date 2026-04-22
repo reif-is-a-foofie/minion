@@ -377,6 +377,57 @@ class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
 
 
+@app.post("/nuke")
+def nuke_db() -> Dict[str, Any]:
+    """Delete the local memory database and related runtime artifacts.
+
+    Intended for "factory reset" / clean-slate behaviour. The desktop app
+    should restart the sidecar after calling this.
+    """
+    removed: List[str] = []
+    missing: List[str] = []
+
+    candidates = [
+        State.db_path,
+        State.data_dir / "telemetry.jsonl",
+        State.data_dir / "telemetry.jsonl.1",
+        State.data_dir / ".staging",
+    ]
+    for p in candidates:
+        try:
+            if not p.exists():
+                missing.append(str(p))
+                continue
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed.append(str(p))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to remove {p}: {e.__class__.__name__}: {e}")
+
+    # Ensure the directory still exists (so the next boot can recreate db).
+    try:
+        State.data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to ensure data_dir: {e.__class__.__name__}: {e}")
+
+    # Drop any cached per-thread sqlite connection so a future request
+    # can't keep using a deleted DB file handle.
+    try:
+        c = getattr(State._tls, "conn", None)
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+            State._tls.conn = None
+    except Exception:
+        pass
+
+    return {"removed": removed, "missing": missing, "db_path": str(State.db_path)}
+
+
 @app.get("/settings")
 def settings_endpoint() -> Dict[str, Any]:
     data = load_settings(State.data_dir)

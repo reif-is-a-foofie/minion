@@ -159,6 +159,10 @@ export async function deleteSource(body: { path?: string; source_id?: string }):
   });
 }
 
+export async function nukeDb(): Promise<{ removed: string[]; missing: string[]; db_path: string }> {
+  return apiFetch("/nuke", { method: "POST" });
+}
+
 export type ConnState = "connecting" | "open" | "closed" | "unreachable";
 
 /// Connect to the sidecar's `/events` WebSocket with bounded retries.
