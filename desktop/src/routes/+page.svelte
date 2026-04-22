@@ -763,7 +763,7 @@
 
 {#if showSettings}
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
-    <div class="modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+    <div class="modal settings-modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <header class="modal-head">
         <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
         <h2>Settings</h2>
@@ -771,109 +771,111 @@
         <button class="ghost" onclick={() => (showSettings = false)}>Close</button>
       </header>
 
-      <div class="modal-section settings-section">
-        <div class="section-title small">Server</div>
-        <div class="setting-row">
-          <div class="setting-main">
-            <div class="setting-label">Sidecar status</div>
-            <div class="setting-desc">
-              {conn === "open"
-                ? `ready · ${config?.api_base ?? ""}`
-                : conn === "connecting"
-                  ? "starting up…"
-                  : "unreachable — try Restart"}
+      <div class="settings-body">
+        <div class="modal-section settings-section">
+          <div class="section-title small">Server</div>
+          <div class="setting-row">
+            <div class="setting-main">
+              <div class="setting-label">Sidecar status</div>
+              <div class="setting-desc">
+                {conn === "open"
+                  ? `ready · ${config?.api_base ?? ""}`
+                  : conn === "connecting"
+                    ? "starting up…"
+                    : "unreachable — try Restart"}
+              </div>
             </div>
+            <button
+              class="ghost"
+              onclick={handleRestart}
+              disabled={restarting}
+              title="Kill and respawn the Python sidecar"
+            >
+              {restarting ? "restarting…" : "Restart"}
+            </button>
           </div>
-          <button
-            class="ghost"
-            onclick={handleRestart}
-            disabled={restarting}
-            title="Kill and respawn the Python sidecar"
-          >
-            {restarting ? "restarting…" : "Restart"}
-          </button>
-        </div>
-        <div class="setting-row">
-          <div class="setting-main">
-            <div class="setting-label">Claude Desktop</div>
-            <div class="setting-desc">
-              {connectMsg || "Register Minion in Claude Desktop's mcpServers."}
+          <div class="setting-row">
+            <div class="setting-main">
+              <div class="setting-label">Claude Desktop</div>
+              <div class="setting-desc">
+                {connectMsg || "Register Minion in Claude Desktop's mcpServers."}
+              </div>
             </div>
+            <button
+              class="ghost"
+              onclick={runConnect}
+              disabled={connecting}
+              title="Add Minion to Claude Desktop's mcpServers"
+            >
+              {connecting ? "connecting…" : "Connect"}
+            </button>
           </div>
-          <button
-            class="ghost"
-            onclick={runConnect}
-            disabled={connecting}
-            title="Add Minion to Claude Desktop's mcpServers"
-          >
-            {connecting ? "connecting…" : "Connect"}
-          </button>
         </div>
-      </div>
 
-      <div class="modal-section settings-section">
-        <div class="section-title small">Danger zone</div>
-        <div class="setting-row">
-          <div class="setting-main">
-            <div class="setting-label">Nuke local database</div>
-            <div class="setting-desc">
-              Deletes <span class="mono">memory.db</span> (your indexed memory) and resets Minion to a clean slate.
+        <div class="modal-section settings-section">
+          <div class="section-title small">Danger zone</div>
+          <div class="setting-row">
+            <div class="setting-main">
+              <div class="setting-label">Nuke local database</div>
+              <div class="setting-desc">
+                Deletes <span class="mono">memory.db</span> (your indexed memory) and resets Minion to a clean slate.
+              </div>
             </div>
+            <button class="ghost danger" onclick={runNukeDb} title="Delete memory.db and restart the sidecar">
+              Nuke DB
+            </button>
           </div>
-          <button class="ghost danger" onclick={runNukeDb} title="Delete memory.db and restart the sidecar">
-            Nuke DB
-          </button>
-        </div>
-        <div class="setting-row">
-          <div class="setting-main">
-            <div class="setting-label">Factory reset</div>
-            <div class="setting-desc">
-              Wipes the database <em>and</em> clears the inbox for a truly fresh instance.
+          <div class="setting-row">
+            <div class="setting-main">
+              <div class="setting-label">Factory reset</div>
+              <div class="setting-desc">
+                Wipes the database <em>and</em> clears the inbox for a truly fresh instance.
+              </div>
             </div>
+            <button class="ghost danger" onclick={runFactoryReset} title="Delete memory.db, clear inbox, and restart the sidecar">
+              Factory reset
+            </button>
           </div>
-          <button class="ghost danger" onclick={runFactoryReset} title="Delete memory.db, clear inbox, and restart the sidecar">
-            Factory reset
-          </button>
         </div>
-      </div>
 
-      <div class="modal-section settings-section">
-        <div class="section-title small">
-          File types
-          <span class="section-hint">{savingSettings ? "saving…" : "toggle what Minion ingests"}</span>
+        <div class="modal-section settings-section">
+          <div class="section-title small">
+            File types
+            <span class="section-hint">{savingSettings ? "saving…" : "toggle what Minion ingests"}</span>
+          </div>
+          {#if !settingsLoaded && settingsError}
+            <div class="empty">
+              Couldn't reach the sidecar: {settingsError}.
+              <button class="link" onclick={loadSettings}>Retry</button>
+            </div>
+          {:else if !settingsLoaded}
+            <div class="empty">Loading…</div>
+          {:else}
+            <ul class="kind-list">
+              {#each allKinds as k}
+                {@const enabled = !disabledKinds.has(k)}
+                <li class="kind-row" class:kind-off={!enabled}>
+                  <label class="kind-toggle">
+                    <input
+                      type="checkbox"
+                      checked={enabled}
+                      onchange={() => toggleKind(k)}
+                      disabled={savingSettings}
+                    />
+                    <span class="kind-name">
+                      <span class="kind kind-{k === 'chatgpt-export' ? 'chatgpt-export' : k}">{(KIND_LABELS[k] ?? k).toLowerCase()}</span>
+                    </span>
+                    <span class="kind-desc">{KIND_DESCRIPTIONS[k] ?? ""}</span>
+                  </label>
+                </li>
+              {/each}
+            </ul>
+            <div class="settings-note">
+              Files of disabled kinds are left alone on disk — Minion will log
+              them as skipped. Re-enable and restart the sidecar to pick them up.
+            </div>
+          {/if}
         </div>
-        {#if !settingsLoaded && settingsError}
-          <div class="empty">
-            Couldn't reach the sidecar: {settingsError}.
-            <button class="link" onclick={loadSettings}>Retry</button>
-          </div>
-        {:else if !settingsLoaded}
-          <div class="empty">Loading…</div>
-        {:else}
-          <ul class="kind-list">
-            {#each allKinds as k}
-              {@const enabled = !disabledKinds.has(k)}
-              <li class="kind-row" class:kind-off={!enabled}>
-                <label class="kind-toggle">
-                  <input
-                    type="checkbox"
-                    checked={enabled}
-                    onchange={() => toggleKind(k)}
-                    disabled={savingSettings}
-                  />
-                  <span class="kind-name">
-                    <span class="kind kind-{k === 'chatgpt-export' ? 'chatgpt-export' : k}">{(KIND_LABELS[k] ?? k).toLowerCase()}</span>
-                  </span>
-                  <span class="kind-desc">{KIND_DESCRIPTIONS[k] ?? ""}</span>
-                </label>
-              </li>
-            {/each}
-          </ul>
-          <div class="settings-note">
-            Files of disabled kinds are left alone on disk — Minion will log
-            them as skipped. Re-enable and restart the sidecar to pick them up.
-          </div>
-        {/if}
       </div>
     </div>
   </div>
@@ -1566,6 +1568,16 @@
     flex-direction: column;
     overflow: hidden;
     box-shadow: var(--shadow-m);
+  }
+  .settings-modal .settings-body {
+    overflow-y: auto;
+    min-height: 0;
+  }
+  /* In Settings, avoid nested “scroll within scroll” which feels crunched. */
+  .settings-modal .modal-section {
+    max-height: none;
+    overflow: visible;
+    flex: 0 0 auto;
   }
   .modal-head {
     display: flex;
