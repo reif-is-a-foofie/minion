@@ -365,15 +365,27 @@ def start_background(
 
             # Filter to actionable paths up front so batch_total is accurate.
             actionable: List[Path] = []
+            seen_actionable: Set[str] = set()
             export_dirs_to_ingest: Set[Path] = set()
             for path_str in paths:
-                p = Path(path_str)
-                if not p.exists():
+                raw = Path(path_str)
+                if not raw.exists():
                     n = delete_source_by_path(conn, path_str)
                     if n:
                         log.info("removed source (deleted): %s", path_str)
                         _emit("removed", {"path": path_str, "chunks": n})
                     continue
+                try:
+                    p = raw.expanduser().resolve()
+                except OSError:
+                    log.warning("could not resolve inbox path %s", raw)
+                    continue
+                # Match ingest_file's stored path and WS `source_updated` keys
+                # (always resolved). Watchdog often gives non-canonical paths; if
+                # we emit progress under one string and done under another, the
+                # UI leaves a stale row that later becomes a spurious "failed".
+                # Also dedupe: /var/... and /private/var/... can both land in one
+                # batch and double-ingest the same file (race → bogus failure).
                 # Files under an export dir split two ways: the text-bearing
                 # manifests are owned by the dir-level chatgpt_export source
                 # (redirect), everything else (attachments) flows through
@@ -387,6 +399,10 @@ def start_background(
                     continue
                 if not p.is_file() or not _is_ingestable(p):
                     continue
+                key = str(p)
+                if key in seen_actionable:
+                    continue
+                seen_actionable.add(key)
                 actionable.append(p)
 
             # Ingest any affected export dirs as single sources. Each one is
