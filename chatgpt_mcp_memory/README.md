@@ -358,6 +358,7 @@ new kind automatically.
 | `MINION_VISION_MODEL` | unset | Ollama model name for image captioning (e.g. `llava`) |
 | `MINION_OLLAMA_MAX_CPU_PCT` | `30` | Soft cap: sets Ollama `num_thread` to about this percent of logical CPUs (`0` / `off` = uncapped) |
 | `MINION_OLLAMA_MAX_INFLIGHT` | `1` when capped, else `2` | Max concurrent `ollama.chat` calls in this process |
+| `MINION_SKIP_MANAGED_OLLAMA` | unset | Desktop only: set to `1` so the Tauri shell does **not** auto-download Ollama into the data dir |
 | `MINION_RETRIEVAL_POLICY` / `CHATGPT_MCP_RETRIEVAL_POLICY` | `<data>/retrieval_policy.md` | Override policy path |
 | `CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS` | `20000` | Cap for injected `initialize.instructions` |
 | `MINION_VOICE` | `<data>/voice.md` | Override voice-profile path |

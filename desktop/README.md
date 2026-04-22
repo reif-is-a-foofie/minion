@@ -39,7 +39,10 @@ anything else that speaks MCP) with one click.
 
 - **Rust shell** (`src-tauri/`): owns the window, resolves the data dir
   (`~/Library/Application Support/Minion/data`), spawns the Python sidecar,
-  exposes `app_config`, `copy_into_inbox`, `reveal_in_finder` commands.
+  can **download Ollama** into `<data_dir>/managed-ollama/` if no system
+  `ollama` exists (official universal macOS zip — same binary for Intel and
+  Apple Silicon). Set `MINION_SKIP_MANAGED_OLLAMA=1` to disable.
+  Exposes `app_config`, `copy_into_inbox`, `reveal_in_finder` commands.
 - **Sidecar** (`chatgpt_mcp_memory/src/api.py`): the same ingest + store
   modules the MCP uses, exposed as HTTP. WebSocket `/events` pushes live
   ingest progress and heartbeats.

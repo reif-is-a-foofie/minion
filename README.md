@@ -65,6 +65,8 @@ If you pick the wrong one, macOS may refuse to open the app or show an architect
 4. In Minion, open **Settings → Claude (MCP)** and click **Add to Claude**. Then **fully quit and reopen Claude Desktop** so it loads the new MCP entry.
 5. Optional: import a **ChatGPT export** (zip or folder) via the drop zone so the index has history on day one.
 
+**Ollama (image captions):** If you do not already have Ollama installed, Minion downloads the **official macOS Ollama app** (one build for both Apple Silicon and Intel) into your Minion data folder on first launch and starts it locally. To skip that behavior (e.g. corporate machines), set **`MINION_SKIP_MANAGED_OLLAMA=1`** before opening the app.
+
 ---
 
 ## Build from source (developers)

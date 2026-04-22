@@ -4,9 +4,12 @@
 // - Resolve (and create) the user's Minion data dir + inbox
 // - Discover the Python sidecar source (bundled under `Resources/sidecar` in
 //   the shipped .app, or a dev checkout walking up from current_exe)
-// - First-launch bootstrap: find a system `python3 >= 3.10`, create a venv
-//   under `<data_dir>/venv`, pip install the bundled sidecar requirements.
-//   Streams `sidecar://status` events to the UI so the window isn't blank.
+// - First-launch bootstrap: find a system `python3 >= 3.10` (or download a
+//   pinned arch-matched CPython), create a venv under `<data_dir>/venv`, pip
+//   install the bundled sidecar requirements. Streams `sidecar://status`.
+// - Ollama: if no `ollama` on the system, download the official universal
+//   macOS zip into `<data_dir>/managed-ollama/` (override with
+//   MINION_SKIP_MANAGED_OLLAMA=1).
 // - Spawn the Python API sidecar as a managed child process, using the
 //   bootstrapped venv and the bundled source tree (no compile-time paths).
 // - Expose minimal Tauri commands the frontend uses:
@@ -84,7 +87,8 @@ fn should_skip_dir(name: &str) -> bool {
 struct AppState {
     sidecar: Mutex<Option<Child>>,
     ollama: Mutex<Option<Child>>,
-    ollama_bin: Option<PathBuf>,
+    /// Ollama CLI path (bundled, Homebrew, PATH, or Minion-managed download).
+    ollama_bin: Mutex<Option<PathBuf>>,
     /// Model currently wired into the Python sidecar via MINION_VISION_MODEL.
     /// `None` means captioning is off.
     vision_model: Mutex<Option<String>>,
@@ -105,6 +109,13 @@ struct AppState {
 // MINION_VISION_MODEL env var if you want llava or another vision model.
 const DEFAULT_VISION_MODEL: &str = "moondream";
 const OLLAMA_PORT: u16 = 11434;
+
+/// Official Ollama macOS zip (fat/universal). Update tag + SHA together when bumping.
+/// https://github.com/ollama/ollama/releases
+const MANAGED_OLLAMA_TAG: &str = "v0.21.1";
+const MANAGED_OLLAMA_ZIP: &str = "Ollama-darwin.zip";
+const MANAGED_OLLAMA_SHA256: &str =
+    "56163f12d8e7a7386812575d2e1073bdd96966ec788df7921fe54dd7d3beb979";
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -318,8 +329,18 @@ fn ensure_managed_python(app: &AppHandle, data_dir: &Path) -> Result<(PathBuf, S
     // Pinned python-build-standalone artifact (install_only) + checksum.
     // This is downloaded only when the host doesn't have Python 3.10+.
     let tag = "20260320";
-    let file = format!("cpython-3.11.15+{tag}-x86_64-apple-darwin-install_only.tar.gz");
-    let sha_expected = "d3d0bdfd5e53e5911807bf0942fcc6220912263f292fd203642c2b93b5ab1f8e";
+    let (triple, sha_expected) = if cfg!(target_arch = "aarch64") {
+        (
+            "aarch64-apple-darwin",
+            "235c98abd103755852a27e4126a46b64adac9ba2dda547e0f9c97d216df095a0",
+        )
+    } else {
+        (
+            "x86_64-apple-darwin",
+            "d3d0bdfd5e53e5911807bf0942fcc6220912263f292fd203642c2b93b5ab1f8e",
+        )
+    };
+    let file = format!("cpython-3.11.15+{tag}-{triple}-install_only.tar.gz");
     let base = format!("https://github.com/astral-sh/python-build-standalone/releases/download/{tag}");
     let url = format!("{base}/{file}");
     let sums_url = format!("{base}/SHA256SUMS");
@@ -894,9 +915,18 @@ fn spawn_sidecar(
 // Ollama sidecar (optional; enables image captioning for pure photos)
 // ---------------------------------------------------------------------------
 
-/// Prefer a binary bundled inside the .app, fall back to PATH. Returns the
-/// first candidate that exists on disk.
-fn find_ollama_binary() -> Option<PathBuf> {
+fn managed_ollama_cli_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("managed-ollama")
+        .join("Ollama.app")
+        .join("Contents")
+        .join("Resources")
+        .join("ollama")
+}
+
+/// Prefer a binary bundled inside the .app, then system installs, then a
+/// Minion-managed copy under `<data_dir>/managed-ollama/`.
+fn find_ollama_binary(data_dir: &Path) -> Option<PathBuf> {
     // 1) Bundled under Resources (from tauri.bundle.resources).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(contents) = exe.parent().and_then(Path::parent) {
@@ -907,23 +937,137 @@ fn find_ollama_binary() -> Option<PathBuf> {
         }
     }
     // 2) System install (Homebrew / Ollama.app installer).
-    for p in &["/usr/local/bin/ollama", "/opt/homebrew/bin/ollama"] {
+    for p in &["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama"] {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Some(pb);
         }
     }
-    // 3) Fall through to `ollama` on PATH.
-    let out = Command::new("which").arg("ollama").output().ok()?;
+    // 3) `ollama` on PATH.
+    if let Ok(out) = Command::new("which").arg("ollama").output() {
+        if out.status.success() {
+            if let Ok(path) = String::from_utf8(out.stdout) {
+                let path = path.trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    // 4) Prior Minion-managed install (official universal darwin zip).
+    let managed = managed_ollama_cli_path(data_dir);
+    if managed.is_file() {
+        return Some(managed);
+    }
+    None
+}
+
+/// Download the official Ollama macOS app bundle into `<data_dir>/managed-ollama/`.
+/// The published zip is a single macOS build (works on Apple Silicon and Intel).
+/// Set `MINION_SKIP_MANAGED_OLLAMA=1` to disable (locked-down environments).
+fn ensure_managed_ollama(app: &AppHandle, data_dir: &Path) -> Result<PathBuf, String> {
+    if std::env::var("MINION_SKIP_MANAGED_OLLAMA").ok().as_deref() == Some("1") {
+        return Err("managed Ollama disabled (MINION_SKIP_MANAGED_OLLAMA=1)".into());
+    }
+    let bin = managed_ollama_cli_path(data_dir);
+    if bin.is_file() {
+        let ok = Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(bin);
+        }
+        let _ = fs::remove_dir_all(data_dir.join("managed-ollama"));
+    }
+
+    let emit = |stage: &str, message: &str| {
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({"state": stage, "message": message}),
+        );
+    };
+
+    let root = data_dir.join("managed-ollama");
+    let _ = fs::create_dir_all(&root);
+    let url = format!(
+        "https://github.com/ollama/ollama/releases/download/{MANAGED_OLLAMA_TAG}/{MANAGED_OLLAMA_ZIP}"
+    );
+    let zip_path = root.join("Ollama-darwin.download.zip");
+
+    emit(
+        "installing",
+        "Downloading Ollama for macOS (first launch, ~120 MB)…",
+    );
+    dbg(
+        "managed_ollama",
+        serde_json::json!({"state": "download", "url": url}),
+    );
+    let status = Command::new("curl")
+        .args(["-fL", "-o"])
+        .arg(&zip_path)
+        .arg(&url)
+        .status()
+        .map_err(|e| format!("curl launch failed: {e}"))?;
+    if !status.success() {
+        let _ = fs::remove_file(&zip_path);
+        return Err(format!(
+            "failed to download Ollama (exit {})",
+            status.code().unwrap_or(-1)
+        ));
+    }
+
+    emit("installing", "Verifying Ollama download…");
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&zip_path)
+        .output()
+        .map_err(|e| format!("shasum failed: {e}"))?;
     if !out.status.success() {
-        return None;
+        let _ = fs::remove_file(&zip_path);
+        return Err("shasum exited with error".into());
     }
-    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
+    let line = String::from_utf8_lossy(&out.stdout);
+    let got = line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "shasum produced no hash".to_string())?;
+    if got != MANAGED_OLLAMA_SHA256 {
+        let _ = fs::remove_file(&zip_path);
+        return Err(format!("Ollama checksum mismatch (got {got})"));
     }
+
+    emit("installing", "Unpacking Ollama…");
+    let _ = fs::remove_dir_all(root.join("Ollama.app"));
+    let st = Command::new("unzip")
+        .args(["-q", "-o", "-d"])
+        .arg(&root)
+        .arg(&zip_path)
+        .status()
+        .map_err(|e| format!("unzip launch failed: {e}"))?;
+    if !st.success() {
+        let _ = fs::remove_file(&zip_path);
+        return Err(format!("unzip failed (exit {})", st.code().unwrap_or(-1)));
+    }
+    let _ = fs::remove_file(&zip_path);
+
+    if !bin.is_file() {
+        return Err("managed Ollama install missing ollama binary".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&bin, fs::Permissions::from_mode(0o755));
+    }
+    Ok(bin)
+}
+
+fn resolve_ollama_for_minion(app: &AppHandle, data_dir: &Path) -> Option<PathBuf> {
+    if let Some(p) = find_ollama_binary(data_dir) {
+        return Some(p);
+    }
+    ensure_managed_ollama(app, data_dir).ok()
 }
 
 fn spawn_ollama(bin: &Path) -> Option<Child> {
@@ -1380,13 +1524,17 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
 }
 
 /// Snapshot for the UI header chip. `state` is one of:
-///   "unavailable" — no ollama binary on disk (install it to enable captions)
+///   "unavailable" — no ollama binary yet (managed download may still be running)
 ///   "off"         — ollama present but model not pulled
 ///   "pulling"     — model download in progress (progress events stream separately)
 ///   "ready"       — model is pulled AND wired into the Python sidecar env
 #[tauri::command]
 fn vision_status(state: tauri::State<AppState>) -> serde_json::Value {
-    let bin = state.ollama_bin.clone();
+    let bin = state
+        .ollama_bin
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
     let active = state.vision_model.lock().ok().and_then(|g| g.clone());
     let model = active
         .clone()
@@ -1417,10 +1565,24 @@ fn ensure_vision_model(
     state: tauri::State<AppState>,
     model: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let bin = state
-        .ollama_bin
-        .clone()
-        .ok_or_else(|| "ollama not installed".to_string())?;
+    let bin = {
+        let mut guard = state
+            .ollama_bin
+            .lock()
+            .map_err(|e| format!("ollama_bin lock poisoned: {e}"))?;
+        if let Some(p) = guard.as_ref() {
+            p.clone()
+        } else {
+            let p = find_ollama_binary(&state.data_dir)
+                .or_else(|| ensure_managed_ollama(&app, &state.data_dir).ok())
+                .ok_or_else(|| {
+                    "Ollama is not available (download failed or MINION_SKIP_MANAGED_OLLAMA=1)."
+                        .to_string()
+                })?;
+            *guard = Some(p.clone());
+            p
+        }
+    };
     let model = model.unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string());
 
     // Start the server if not already up (e.g. user quit Ollama.app).
@@ -1583,34 +1745,13 @@ pub fn run() {
     let api_port = resolve_initial_sidecar_port();
     let api_token = sidecar_api_token(&data_dir);
 
-    // Start ollama so the Python sidecar can be spawned with the vision env
-    // already populated when the model is present.
-    let target_model = std::env::var("MINION_VISION_MODEL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string());
-    let ollama_bin = find_ollama_binary();
-    let mut ollama_child: Option<Child> = None;
-    let mut vision_model: Option<String> = None;
-    let mut needs_pull = false;
-    if let Some(bin) = ollama_bin.clone() {
-        ollama_child = spawn_ollama(&bin);
-        if wait_for_ollama(Duration::from_secs(5)) {
-            if ollama_has_model(&bin, &target_model) {
-                vision_model = Some(target_model.clone());
-            } else {
-                needs_pull = true;
-            }
-        }
-    }
-
-    // Sidecar spawn moves into `setup` below because it needs the AppHandle
-    // to resolve the bundled resource dir. Store None for now; setup fills it.
+    // Sidecar + Ollama setup run in `setup` below (needs AppHandle for
+    // managed Ollama download progress and bundled path resolution).
     let state = AppState {
         sidecar: Mutex::new(None),
-        ollama: Mutex::new(ollama_child),
-        ollama_bin: ollama_bin.clone(),
-        vision_model: Mutex::new(vision_model.clone()),
+        ollama: Mutex::new(None),
+        ollama_bin: Mutex::new(None),
+        vision_model: Mutex::new(None),
         data_dir: data_dir.clone(),
         inbox: inbox.clone(),
         api_port,
@@ -1619,7 +1760,6 @@ pub fn run() {
         sidecar_python: Mutex::new(None),
     };
 
-    let initial_vision_model = vision_model.clone();
     let api_token_bg = api_token.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1632,7 +1772,6 @@ pub fn run() {
             let data_dir_bg = data_dir.clone();
             let inbox_bg = inbox.clone();
             let port_bg = api_port;
-            let vm_bg = initial_vision_model.clone();
             thread::spawn(move || {
                 let state = match handle.try_state::<AppState>() {
                     Some(s) => s,
@@ -1641,6 +1780,13 @@ pub fn run() {
                         return;
                     }
                 };
+                let target_model = std::env::var("MINION_VISION_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string());
+                let mut needs_pull_local = false;
+                let mut vision_opt: Option<String> = None;
+
                 let _ = handle.emit(
                     "sidecar://status",
                     serde_json::json!({"state": "starting", "message": "Locating sidecar…"}),
@@ -1683,6 +1829,33 @@ pub fn run() {
                     }
                 };
 
+                let _ = handle.emit(
+                    "sidecar://status",
+                    serde_json::json!({
+                        "state": "starting",
+                        "message": "Preparing Ollama (image captions)…",
+                    }),
+                );
+                if let Some(ref bin) = resolve_ollama_for_minion(&handle, &data_dir_bg) {
+                    if let Ok(mut og) = state.ollama_bin.lock() {
+                        *og = Some(bin.clone());
+                    }
+                    let ochild = spawn_ollama(bin);
+                    if let Ok(mut og) = state.ollama.lock() {
+                        *og = ochild;
+                    }
+                    if wait_for_ollama(Duration::from_secs(15)) {
+                        if ollama_has_model(bin, &target_model) {
+                            vision_opt = Some(target_model.clone());
+                        } else {
+                            needs_pull_local = true;
+                        }
+                    }
+                }
+                if let Ok(mut vm) = state.vision_model.lock() {
+                    *vm = vision_opt.clone();
+                }
+
                 let python = match bootstrap_venv(&handle, &data_dir_bg, &requirements) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1712,7 +1885,7 @@ pub fn run() {
                     &data_dir_bg,
                     &inbox_bg,
                     port_bg,
-                    vm_bg.as_deref(),
+                    vision_opt.as_deref(),
                     &api_token_bg,
                 );
                 if let Some(c) = child {
@@ -1755,6 +1928,38 @@ pub fn run() {
                         "sidecar://status",
                         serde_json::json!({"state": "ready"}),
                     );
+                    if needs_pull_local {
+                        let handle2 = handle.clone();
+                        let model = target_model.clone();
+                        thread::spawn(move || {
+                            let state = match handle2.try_state::<AppState>() {
+                                Some(s) => s,
+                                None => return,
+                            };
+                            for _ in 0..600 {
+                                if state
+                                    .sidecar_python
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.clone())
+                                    .is_some()
+                                {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(500));
+                            }
+                            let _ = emit_vision(&handle2, "start", &format!("pulling {model}…"));
+                            if let Err(e) =
+                                ensure_vision_model(handle2.clone(), state, Some(model.clone()))
+                            {
+                                let _ = emit_vision(
+                                    &handle2,
+                                    "error",
+                                    &format!("auto-enable failed: {e}"),
+                                );
+                            }
+                        });
+                    }
                 } else {
                     let _ = handle.emit(
                         "sidecar://status",
@@ -1765,39 +1970,6 @@ pub fn run() {
                     );
                 }
             });
-
-            // First-launch auto-pull: if ollama is present but the default
-            // vision model isn't, grab it in the background. Progress streams
-            // into the UI terminal via the `vision://progress` event so it
-            // shows up in the same log as everything else.
-            if needs_pull {
-                let handle = app.handle().clone();
-                let model = target_model.clone();
-                thread::spawn(move || {
-                    let state = match handle.try_state::<AppState>() {
-                        Some(s) => s,
-                        None => return,
-                    };
-                    // Wait for the initial sidecar bootstrap to finish so the
-                    // vision-model respawn has a python + src_dir to reuse.
-                    for _ in 0..600 {
-                        if state
-                            .sidecar_python
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.clone())
-                            .is_some()
-                        {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                    let _ = emit_vision(&handle, "start", &format!("pulling {model}…"));
-                    if let Err(e) = ensure_vision_model(handle.clone(), state, Some(model.clone())) {
-                        let _ = emit_vision(&handle, "error", &format!("auto-enable failed: {e}"));
-                    }
-                });
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
