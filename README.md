@@ -31,6 +31,17 @@
 
 For tool tables, parsers, env flags, and CLI-only workflows, see **[`chatgpt_mcp_memory/README.md`](./chatgpt_mcp_memory/README.md)**. For Tauri architecture and `tauri dev` / `tauri build`, see **[`desktop/README.md`](./desktop/README.md)**.
 
+### Where the app lives in this repo (on GitHub)
+
+All of it is in **this monorepo**—nothing is shipped from a private subtree:
+
+| Path | What it is |
+|------|----------------|
+| **[`desktop/`](https://github.com/reif-is-a-foofie/Minion/tree/main/desktop)** | macOS app: **SvelteKit** UI + **Tauri 2** Rust shell (`src-tauri/`). |
+| **[`chatgpt_mcp_memory/`](https://github.com/reif-is-a-foofie/Minion/tree/main/chatgpt_mcp_memory)** | **Python** sidecar (FastAPI, ingest, SQLite, MCP). |
+
+On `tauri build`, **`desktop/src-tauri/scripts/sync_sidecar.sh`** copies `chatgpt_mcp_memory`’s `src/` and `requirements*.txt` into `desktop/src-tauri/resources/sidecar/`. That `sidecar/` folder is **gitignored** (generated each build); the canonical source is always **`chatgpt_mcp_memory/`** on GitHub.
+
 ---
 
 ## Install (macOS app)
