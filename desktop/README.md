@@ -69,13 +69,31 @@ Dev quirks:
 - Disable the background watcher with `MINION_DISABLE_WATCHER=1` (useful
   when iterating on ingest logic).
 
+## Release zips: Intel vs Apple Silicon
+
+End users get two downloads on [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases). Names are intentional:
+
+| Zip suffix | CPU | Typical Macs |
+|------------|-----|----------------|
+| **`macos-arm64`** | **Apple Silicon** (aarch64) | M1, M2, M3, M4, … — About This Mac shows **Chip:** Apple M… |
+| **`macos-x64`** | **Intel** (x86_64) | Older Macs — About This Mac shows **Processor:** Intel … |
+
+**Prep for clients:** send the table above (or link to the repo README install section) so they match **Chip** to **arm64** and **Intel** to **x64**.
+
 ## Build
 
 ```bash
+# Default: matches the machine you build on (Apple Silicon → arm64, Intel → x64)
 npm run tauri build
+
+# Apple Silicon .app from any host that has the Rust target installed:
+npm run tauri build -- --target aarch64-apple-darwin
+
+# Intel .app:
+npm run tauri build -- --target x86_64-apple-darwin
 ```
 
-Produces `src-tauri/target/release/bundle/macos/Minion.app`. The dev
+Produces `src-tauri/target/<triple>/release/bundle/macos/Minion.app`. The dev
 build shells out to a repo-local Python; for a standalone `.app` we need to
 bundle the sidecar (PyInstaller) — see `TODO(sidecar-bundle)` in
 `src-tauri/src/lib.rs`. Until then, the packaged app still needs a repo

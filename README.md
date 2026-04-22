@@ -46,8 +46,21 @@ On `tauri build`, **`desktop/src-tauri/scripts/sync_sidecar.sh`** copies `chatgp
 
 ## Install (macOS app)
 
-1. Download the latest **Minion** build from [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) (or build from source — below).
-2. Open the `.app` and, when macOS prompts you, move it to **Applications** (avoid running forever from the disk image or a translocated copy; that can confuse paths and file access).
+### 1. Pick the right download (Intel vs Apple Silicon)
+
+GitHub Releases ship **two** macOS zips. The name tells you the CPU architecture—choose the one that matches the Mac.
+
+| Release file | Your Mac | How to tell |
+|--------------|----------|-------------|
+| **`Minion-*-macos-arm64.zip`** | **Apple Silicon** (M1, M2, M3, M4, …) | Apple menu → **About This Mac** shows a line **Chip:** “Apple M2” (etc.). |
+| **`Minion-*-macos-x64.zip`** | **Intel** (Core i5/i7/i9, Xeon, …) | About This Mac shows **Processor:** with “Intel” in the name, and no **Chip** line (older layout). |
+
+If you pick the wrong zip, macOS may refuse to open the app or show a “damaged” / architecture message. Delete it, download the **other** zip, unzip again, and drag **Minion.app** to **Applications**.
+
+### 2. Install and run
+
+1. Download the matching zip from [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) (or build from source — below).
+2. Unzip, then move **Minion.app** to **Applications** when prompted (avoid running forever from the disk image or a translocated copy; that can confuse paths and file access).
 3. **First launch** can take a few minutes while Minion prepares its embedded Python environment and starts the sidecar. Later launches are quick.
 4. In Minion, open **Settings → Claude (MCP)** and click **Add to Claude**. Then **fully quit and reopen Claude Desktop** so it loads the new MCP entry.
 5. Optional: import a **ChatGPT export** (zip or folder) via the drop zone so the index has history on day one.
