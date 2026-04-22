@@ -6,8 +6,8 @@ Pipeline:
 2) OCR via rapidocr-onnxruntime (pure Python; no tesseract system dep).
 3) Optional local caption via Ollama vision model (llava/llama3.2-vision/
    moondream) when MINION_VISION_MODEL is set. Gives semantic text even when
-   the image has no legible words. Retries once on a runner crash (500) since
-   the ollama runner auto-respawns after a crash.
+   the image has no legible words. Retries on runner crash (500) and on empty
+   HTTP responses (some vision models occasionally return blank content under load).
 
 Error handling is explicit so the ingest layer can surface actionable
 skip reasons (missing-deps vs no-text vs genuinely-empty vs bad-file).
@@ -236,8 +236,9 @@ def _meta_text(meta: dict) -> str:
 def _caption_ollama(path: Path, model: str) -> Tuple[Optional[str], Optional[str]]:
     """Return (caption, error). error=None on success (caption may still be empty).
 
-    Retries once on a runner crash (HTTP 500) since the ollama runner
-    auto-respawns; the first request after a crash often succeeds.
+    Retries on HTTP 500 / runner crashes (ollama respawns) and on **successful**
+    responses whose message body is empty or whitespace — moondream and other
+    small vision models sometimes return blank ``content`` when cold or CPU-bound.
     """
     try:
         import ollama  # type: ignore
@@ -255,23 +256,43 @@ def _caption_ollama(path: Path, model: str) -> Tuple[Optional[str], Optional[str
         }
     ]
     last_err: Optional[str] = None
-    for attempt in range(2):
+    empty_only = False
+    max_attempts = 4
+    for attempt in range(max_attempts):
         try:
             with acquire_ollama_inference():
-                resp = ollama.chat(
-                    model=model,
-                    messages=messages,
-                    options=merged_ollama_options(None),
-                )
-            text = (resp.get("message") or {}).get("content")
-            return (text or None), None
+                opts = merged_ollama_options(None)
+                try:
+                    resp = ollama.chat(
+                        model=model,
+                        messages=messages,
+                        options=opts,
+                        keep_alive="15m",
+                    )
+                except TypeError:
+                    resp = ollama.chat(
+                        model=model,
+                        messages=messages,
+                        options=opts,
+                    )
+            raw = (resp.get("message") or {}).get("content")
+            text = raw.strip() if isinstance(raw, str) else ""
+            if text:
+                return text, None
+            empty_only = True
+            last_err = "empty model response"
+            time.sleep(min(2.0, 0.75 + 0.5 * float(attempt)))
+            continue
         except Exception as e:
             last_err = str(e)
+            empty_only = False
             # Runner crashes surface as 500; give ollama a moment to respawn.
             if "500" in last_err or "runner" in last_err.lower():
                 time.sleep(1.5)
                 continue
             break
+    if empty_only:
+        return None, None
     return None, f"ollama call failed ({last_err})"
 
 

@@ -57,8 +57,8 @@ _EXT_REGISTRY: Dict[str, Tuple[str, str, str]] = {
     ".toml": ("text", "parsers.text", "parse"),
     ".ini":  ("text", "parsers.text", "parse"),
     # HTML
-    ".html": ("html", "parsers.html", "parse"),
-    ".htm":  ("html", "parsers.html", "parse"),
+    ".html": ("html", "parsers.markup_html", "parse"),
+    ".htm":  ("html", "parsers.markup_html", "parse"),
     # PDF
     ".pdf":  ("pdf",  "parsers.pdf",  "parse"),
     # Office docs
