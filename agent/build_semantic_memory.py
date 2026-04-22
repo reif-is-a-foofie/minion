@@ -2,16 +2,19 @@
 import glob
 import json
 import os
-import re
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from fastembed import TextEmbedding
 
+_SRC = Path(__file__).resolve().parent.parent / "chatgpt_mcp_memory" / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from parsers._common import chunk_text, normalize_text  # noqa: E402
 
-DEFAULT_EXPORT_DIR = "/Users/reify/Classified/minion/d9eced211a2a0b9cd1b2d52f595ee063aea7ff88cddbcaad683ae4aa25df7992-2026-03-21-20-25-15-b54da2dcfb0a4295aae2c768c88d320c"
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNKS_PATH = os.path.join(AGENT_DIR, "memory_chunks.jsonl")
@@ -27,13 +30,6 @@ class Chunk:
     role: str
     create_time: Optional[float]
     text: str
-
-
-def normalize_text(text):
-    text = text.replace("\r\n", "\n").strip()
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
 
 
 def is_persona_relevant(text):
@@ -111,54 +107,6 @@ def is_persona_relevant(text):
     return any(signal in lowered for signal in persona_signals)
 
 
-def chunk_text(text, max_chars=1400):
-    text = normalize_text(text)
-    if not text:
-        return []
-
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
-    current = []
-    current_len = 0
-
-    for para in paragraphs:
-        para_len = len(para)
-        if current and current_len + para_len + 2 > max_chars:
-            chunks.append("\n\n".join(current))
-            current = [para]
-            current_len = para_len
-        else:
-            current.append(para)
-            current_len += para_len + (2 if current_len else 0)
-
-    if current:
-        chunks.append("\n\n".join(current))
-
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= max_chars:
-            final_chunks.append(chunk)
-            continue
-        sentences = re.split(r"(?<=[.!?])\s+", chunk)
-        current = []
-        current_len = 0
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if current and current_len + len(sentence) + 1 > max_chars:
-                final_chunks.append(" ".join(current))
-                current = [sentence]
-                current_len = len(sentence)
-            else:
-                current.append(sentence)
-                current_len += len(sentence) + (1 if current_len else 0)
-        if current:
-            final_chunks.append(" ".join(current))
-
-    return [c for c in final_chunks if c.strip()]
-
-
 def get_linear_path(mapping, current_node):
     path = []
     node_id = current_node
@@ -182,7 +130,13 @@ def extract_text(parts):
 
 
 def load_conversations():
-    export_dir = os.environ.get("CHATGPT_EXPORT_DIR") or (sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EXPORT_DIR)
+    export_dir = os.environ.get("CHATGPT_EXPORT_DIR") or (sys.argv[1] if len(sys.argv) > 1 else None)
+    if not export_dir:
+        print(
+            "Set CHATGPT_EXPORT_DIR or pass the ChatGPT export directory as argv[1].",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     files = sorted(glob.glob(os.path.join(export_dir, "conversations-*.json")))
     conversations = []
     for path in files:
@@ -226,7 +180,7 @@ def build_chunks():
                 continue
             if role == "user" and not is_persona_relevant(text):
                 continue
-            for subchunk in chunk_text(text):
+            for subchunk in chunk_text(text, max_chars=1400):
                 chunk_num += 1
                 chunks.append(
                     Chunk(

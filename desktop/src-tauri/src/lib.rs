@@ -237,6 +237,106 @@ fn find_system_python() -> Option<(PathBuf, String)> {
     None
 }
 
+fn managed_python_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("managed-python").join("python").join("bin").join("python3")
+}
+
+fn ensure_managed_python(app: &AppHandle, data_dir: &Path) -> Result<(PathBuf, String), String> {
+    let py = managed_python_path(data_dir);
+    if py.exists() {
+        let out = Command::new(&py)
+            .arg("--version")
+            .output()
+            .map_err(|e| format!("managed python failed: {e}"))?;
+        let ver = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        return Ok((py, ver.trim().to_string()));
+    }
+
+    let emit = |stage: &str, message: &str| {
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({"state": stage, "message": message}),
+        );
+    };
+
+    // Pinned python-build-standalone artifact (install_only) + checksum.
+    // This is downloaded only when the host doesn't have Python 3.10+.
+    let tag = "20260320";
+    let file = format!("cpython-3.11.15+{tag}-x86_64-apple-darwin-install_only.tar.gz");
+    let sha_expected = "d3d0bdfd5e53e5911807bf0942fcc6220912263f292fd203642c2b93b5ab1f8e";
+    let base = format!("https://github.com/astral-sh/python-build-standalone/releases/download/{tag}");
+    let url = format!("{base}/{file}");
+    let sums_url = format!("{base}/SHA256SUMS");
+
+    let mp = data_dir.join("managed-python");
+    let _ = fs::create_dir_all(&mp);
+    let tarball = mp.join(&file);
+
+    emit("installing", "Downloading managed Python (first launch)…");
+    dbg("managed_python", serde_json::json!({"state": "download", "url": url}));
+
+    let status = Command::new("curl")
+        .args(["-fL", "-o"])
+        .arg(&tarball)
+        .arg(&url)
+        .status()
+        .map_err(|e| format!("curl launch failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to download managed python (exit {})", status.code().unwrap_or(-1)));
+    }
+
+    // Verify checksum by pulling SHA256SUMS and matching the line.
+    emit("installing", "Verifying managed Python…");
+    let sums = Command::new("curl")
+        .args(["-fsSL"])
+        .arg(&sums_url)
+        .output()
+        .map_err(|e| format!("curl SHA256SUMS failed: {e}"))?;
+    if !sums.status.success() {
+        return Err("failed to fetch SHA256SUMS".to_string());
+    }
+    let sums_txt = String::from_utf8_lossy(&sums.stdout);
+    let mut ok = false;
+    for line in sums_txt.lines() {
+        if line.ends_with(&file) && line.starts_with(sha_expected) {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        return Err("managed python checksum mismatch".to_string());
+    }
+
+    // Extract under managed-python/python/
+    emit("installing", "Installing managed Python…");
+    let target = mp.join("python");
+    let _ = fs::remove_dir_all(&target);
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&mp)
+        .status()
+        .map_err(|e| format!("tar launch failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar extract failed (exit {})", status.code().unwrap_or(-1)));
+    }
+
+    // The tarball extracts into `python/` at the archive root.
+    if !py.exists() {
+        return Err("managed python install missing python3".to_string());
+    }
+
+    let out = Command::new(&py)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("managed python failed: {e}"))?;
+    let ver = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    Ok((py, ver.trim().to_string()))
+}
+
 /// Path to the venv's Python executable under `<data_dir>/venv`.
 fn venv_python(data_dir: &Path) -> PathBuf {
     data_dir.join("venv").join("bin").join("python")
@@ -268,12 +368,17 @@ fn bootstrap_venv(
 
     // Find a usable system Python. If none, raise a clear, actionable error
     // that the UI can surface verbatim.
-    let (system_py, ver) = find_system_python().ok_or_else(|| {
-        let msg = "Python 3.10+ not found on PATH. Install from https://www.python.org/downloads/ and relaunch Minion.".to_string();
-        emit("error", &msg);
-        dbg("bootstrap", serde_json::json!({"state": "no_python"}));
-        msg
-    })?;
+    let (system_py, ver) = match find_system_python() {
+        Some(v) => v,
+        None => {
+            dbg("bootstrap", serde_json::json!({"state": "no_python"}));
+            ensure_managed_python(app, data_dir).map_err(|e| {
+                let msg = format!("Python 3.10+ not found; managed Python install failed: {e}");
+                emit("error", &msg);
+                msg
+            })?
+        }
+    };
     dbg("bootstrap", serde_json::json!({"system_python": system_py, "version": ver}));
 
     if !py.exists() {

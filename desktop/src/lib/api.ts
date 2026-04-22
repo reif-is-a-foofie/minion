@@ -140,6 +140,174 @@ export async function search(body: {
   });
 }
 
+export type IdentityClaim = {
+  claim_id: string;
+  kind: string;
+  text: string;
+  status: string;
+  confidence?: number | null;
+  source_agent?: string | null;
+  created_at: number;
+  updated_at: number;
+  superseded_by?: string | null;
+  meta?: Record<string, unknown>;
+};
+
+export type IdentityEdge = {
+  edge_id: string;
+  claim_id: string;
+  chunk_id: string | null;
+  source_id: string | null;
+  rationale: string | null;
+  created_at: number;
+};
+
+export async function fetchIdentityClaims(params: {
+  status?: string;
+  kind?: string;
+  limit?: number;
+} = {}): Promise<{ claims: IdentityClaim[]; count: number }> {
+  const q = new URLSearchParams();
+  if (params.status) q.set("status", params.status);
+  if (params.kind) q.set("kind", params.kind);
+  if (params.limit != null) q.set("limit", String(params.limit));
+  const qs = q.toString();
+  return apiFetch(`/identity/claims${qs ? `?${qs}` : ""}`);
+}
+
+export async function patchIdentityClaim(
+  claimId: string,
+  body: { status: string; superseded_by?: string },
+): Promise<{ claim: IdentityClaim | null }> {
+  return apiFetch(`/identity/claims/${encodeURIComponent(claimId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchIdentityClaimEdges(
+  claimId: string,
+): Promise<{ edges: IdentityEdge[]; count: number }> {
+  return apiFetch(`/identity/claims/${encodeURIComponent(claimId)}/edges`);
+}
+
+export async function fetchChunk(
+  chunkId: string,
+  max_chars?: number,
+): Promise<{
+  chunk_id: string;
+  source_id: string;
+  role: string | null;
+  path: string;
+  kind: string;
+  mtime: number;
+  text: string;
+  meta: Record<string, unknown>;
+}> {
+  const q = max_chars != null ? `?max_chars=${max_chars}` : "";
+  return apiFetch(`/chunks/${encodeURIComponent(chunkId)}${q}`);
+}
+
+export async function exportIdentityBundle(body: {
+  out_path?: string;
+  include_chunk_index?: boolean;
+} = {}): Promise<{ path: string; manifest: Record<string, unknown> }> {
+  return apiFetch("/identity/export", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function rebuildPreferenceClusters(body: {
+  sample_limit?: number;
+  k?: number;
+  use_llm?: boolean;
+} = {}): Promise<Record<string, unknown>> {
+  return apiFetch("/identity/clusters/rebuild", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/// Subscribe to GET /search/stream (SSE). Calls onHit for each result; onDone when finished.
+export function openSearchStream(
+  query: string,
+  opts: { top_k?: number; kind?: string; path_glob?: string; role?: string; max_chars?: number } = {},
+  handlers: {
+    onMeta?: (n: number) => void;
+    onHit: (hit: SearchHit) => void;
+    onDone?: () => void;
+    onError?: (msg: string) => void;
+  },
+): () => void {
+  let cancelled = false;
+  (async () => {
+    const cfg = await getConfig();
+    const q = new URLSearchParams({ query });
+    if (opts.top_k != null) q.set("top_k", String(opts.top_k));
+    if (opts.kind) q.set("kind", opts.kind);
+    if (opts.path_glob) q.set("path_glob", opts.path_glob);
+    if (opts.role) q.set("role", opts.role);
+    if (opts.max_chars != null) q.set("max_chars", String(opts.max_chars));
+    const url = `${cfg.api_base}/search/stream?${q}`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok || !res.body) {
+        handlers.onError?.(`${res.status} ${res.statusText}`);
+        return;
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (!cancelled) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const lines = block.split("\n");
+          let ev = "";
+          let data = "";
+          for (const ln of lines) {
+            if (ln.startsWith("event:")) ev = ln.slice(6).trim();
+            if (ln.startsWith("data:")) data = ln.slice(5).trim();
+          }
+          if (ev === "meta") {
+            try {
+              const o = JSON.parse(data) as { count?: number };
+              handlers.onMeta?.(o.count ?? 0);
+            } catch {
+              /* ignore */
+            }
+          } else if (ev === "hit") {
+            try {
+              handlers.onHit(JSON.parse(data) as SearchHit);
+            } catch {
+              /* ignore */
+            }
+          } else if (ev === "done") {
+            handlers.onDone?.();
+          } else if (ev === "error") {
+            try {
+              const o = JSON.parse(data) as { message?: string };
+              handlers.onError?.(o.message ?? "stream error");
+            } catch {
+              handlers.onError?.("stream error");
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (!cancelled) handlers.onError?.((e as Error).message ?? String(e));
+    }
+  })();
+  return () => {
+    cancelled = true;
+  };
+}
+
 export async function ingestPath(path: string, move = false): Promise<{ queued: string }> {
   return apiFetch("/ingest", {
     method: "POST",

@@ -6,14 +6,20 @@
     connectClaudeDesktop,
     copyIntoInbox,
     deleteSource,
+    exportIdentityBundle,
     factoryReset,
-    nukeDb,
+    fetchChunk,
+    fetchIdentityClaimEdges,
+    fetchIdentityClaims,
     fetchSettings,
     fetchSources,
     fetchStatus,
     getConfig,
+    nukeDb,
     onSidecarStatus,
     openEvents,
+    patchIdentityClaim,
+    rebuildPreferenceClusters,
     restartSidecar,
     revealInFinder,
     search,
@@ -22,6 +28,7 @@
     type Active,
     type AppConfig,
     type ConnState,
+    type IdentityClaim,
     type SearchHit,
     type SidecarStatus,
     type Source,
@@ -60,6 +67,98 @@
   // card so the window isn't a silent void while pip runs for ~2 minutes.
   let sidecar = $state<SidecarStatus | null>(null);
 
+  let showIdentity = $state(false);
+  let identityClaims = $state<IdentityClaim[]>([]);
+  let identityLoading = $state(false);
+  let identityTab = $state<"proposed" | "active">("proposed");
+  let evidencePopup = $state<{ path: string; text: string } | null>(null);
+  let clusterBusy = $state(false);
+  let exportBusy = $state(false);
+
+  async function refreshIdentity() {
+    identityLoading = true;
+    try {
+      const st = identityTab === "proposed" ? "proposed" : "active";
+      const res = await fetchIdentityClaims({ status: st, limit: 100 });
+      identityClaims = res.claims;
+    } catch (e) {
+      pushFeed("identity", `load failed: ${(e as Error).message}`);
+    } finally {
+      identityLoading = false;
+    }
+  }
+
+  async function openIdentity() {
+    showIdentity = true;
+    await refreshIdentity();
+  }
+
+  function switchIdentityTab(tab: "proposed" | "active") {
+    identityTab = tab;
+    void refreshIdentity();
+  }
+
+  async function approveClaim(id: string) {
+    try {
+      await patchIdentityClaim(id, { status: "active" });
+      pushFeed("identity", "claim approved");
+      await refreshIdentity();
+    } catch (e) {
+      pushFeed("identity", `approve failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function rejectClaim(id: string) {
+    try {
+      await patchIdentityClaim(id, { status: "rejected" });
+      pushFeed("identity", "claim rejected");
+      await refreshIdentity();
+    } catch (e) {
+      pushFeed("identity", `reject failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function showClaimEvidence(claimId: string) {
+    try {
+      const { edges } = await fetchIdentityClaimEdges(claimId);
+      const first = edges.find((e) => e.chunk_id);
+      if (!first?.chunk_id) {
+        pushFeed("identity", "no evidence chunks linked");
+        return;
+      }
+      const ch = await fetchChunk(first.chunk_id, 1500);
+      evidencePopup = { path: ch.path, text: ch.text };
+    } catch (e) {
+      pushFeed("identity", `evidence: ${(e as Error).message}`);
+    }
+  }
+
+  async function runClusterRebuild() {
+    if (clusterBusy) return;
+    clusterBusy = true;
+    try {
+      const r = await rebuildPreferenceClusters({ use_llm: true });
+      const msg = typeof r.status === "string" ? r.status : "ok";
+      pushFeed("identity", `preference clusters: ${msg}`);
+    } catch (e) {
+      pushFeed("identity", `cluster rebuild: ${(e as Error).message}`);
+    } finally {
+      clusterBusy = false;
+    }
+  }
+
+  async function runIdentityExport() {
+    if (exportBusy) return;
+    exportBusy = true;
+    try {
+      const r = await exportIdentityBundle({});
+      pushFeed("identity", `exported → ${r.path.split("/").pop() ?? r.path}`);
+    } catch (e) {
+      pushFeed("identity", `export: ${(e as Error).message}`);
+    } finally {
+      exportBusy = false;
+    }
+  }
 
   // If we stop hearing from the sidecar for >12s, assume it's wedged even
   // if the socket is nominally "open" -- the UI should flag it.
@@ -663,6 +762,9 @@
       <button class="ghost" onclick={() => (showContents = true)} title="View indexed sources and search">
         Contents
       </button>
+      <button class="ghost" onclick={openIdentity} title="Review identity claims and export">
+        Identity
+      </button>
       <button class="ghost" onclick={openSettings} title="Server, Claude Desktop, and file-type preferences">
         Settings
       </button>
@@ -760,6 +862,104 @@
     </div>
   </section>
 </main>
+
+{#if showIdentity}
+  <div
+    class="modal-overlay"
+    role="button"
+    tabindex="-1"
+    onclick={() => {
+      showIdentity = false;
+      evidencePopup = null;
+    }}
+    onkeydown={(e) =>
+      e.key === "Escape" && ((showIdentity = false), (evidencePopup = null))}
+  >
+    <div
+      class="modal settings-modal"
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      <header class="modal-head">
+        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
+        <h2>Identity</h2>
+        <div class="modal-meta">structured claims · evidence · export</div>
+        <button
+          class="ghost"
+          onclick={() => {
+            showIdentity = false;
+            evidencePopup = null;
+          }}
+        >
+          Close
+        </button>
+      </header>
+
+      <div class="settings-body">
+        <div class="modal-section settings-section">
+          <div class="section-title small">Queue</div>
+          <div class="chips" style="margin-bottom: 0.75rem;">
+            <button type="button" class:chip-active={identityTab === "proposed"} onclick={() => switchIdentityTab("proposed")}>
+              Proposed
+            </button>
+            <button type="button" class:chip-active={identityTab === "active"} onclick={() => switchIdentityTab("active")}>
+              Active
+            </button>
+            <button type="button" class="ghost" onclick={() => refreshIdentity()} disabled={identityLoading}>
+              {identityLoading ? "…" : "Refresh"}
+            </button>
+            <button type="button" class="ghost" onclick={runClusterRebuild} disabled={clusterBusy}>
+              {clusterBusy ? "Clustering…" : "Rebuild clusters"}
+            </button>
+            <button type="button" class="ghost" onclick={runIdentityExport} disabled={exportBusy}>
+              {exportBusy ? "Export…" : "Export zip"}
+            </button>
+          </div>
+          {#if identityClaims.length === 0}
+            <div class="empty">
+              {identityTab === "proposed"
+                ? "No proposed claims. Agents can add them via MCP (`propose_identity_update`)."
+                : "No active claims yet — approve proposals from the Proposed tab."}
+            </div>
+          {:else}
+            <ul class="source-list identity-claim-list">
+              {#each identityClaims as c}
+                <li>
+                  <div class="file-main">
+                    <span class="kind">{c.kind}</span>
+                    <span class="path mono" title={c.claim_id}>{c.claim_id}</span>
+                    {#if c.source_agent}
+                      <span class="meta">via {c.source_agent}</span>
+                    {/if}
+                  </div>
+                  <p class="claim-text">{c.text}</p>
+                  <div class="file-actions">
+                    <button type="button" class="ghost" onclick={() => showClaimEvidence(c.claim_id)}>Evidence</button>
+                    {#if identityTab === "proposed"}
+                      <button type="button" class="ghost" onclick={() => approveClaim(c.claim_id)}>Approve</button>
+                      <button type="button" class="ghost danger" onclick={() => rejectClaim(c.claim_id)}>Reject</button>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+        {#if evidencePopup}
+          <div class="modal-section settings-section evidence-box">
+            <div class="section-title small">Evidence preview</div>
+            <div class="meta mono">{evidencePopup.path}</div>
+            <pre class="evidence-pre">{evidencePopup.text}</pre>
+            <button type="button" class="ghost" onclick={() => (evidencePopup = null)}>Dismiss</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if showSettings}
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
@@ -1812,6 +2012,36 @@
   .file-actions {
     display: flex;
     gap: 4px;
+  }
+  .mono {
+    font-family: var(--mono-font);
+    font-size: 11px;
+  }
+  .claim-text {
+    margin: 8px 0 4px;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+  .identity-claim-list li {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .evidence-box {
+    margin-top: 8px;
+  }
+  .evidence-pre {
+    margin: 8px 0;
+    padding: 10px;
+    max-height: 220px;
+    overflow: auto;
+    font-family: var(--mono-font);
+    font-size: 11px;
+    line-height: 1.4;
+    background: var(--panel-2);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    white-space: pre-wrap;
   }
 
   /* Settings modal: roomy rows, plain-language toggles. */

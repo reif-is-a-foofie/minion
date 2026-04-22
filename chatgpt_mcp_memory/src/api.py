@@ -11,8 +11,18 @@ Endpoints:
   GET  /sources/{source_id}         -> source metadata
   DELETE /sources                   -> body: {"path": "..."} OR {"source_id": "..."}
   POST /search                      -> body: {"query", "top_k", "kind"?, "path_glob"?, "role"?}
+  GET  /search/stream               -> SSE: events `meta`, `hit` (JSON per line), `done`, optional `error`
+  GET  /identity/claims             -> list identity claims (optional ?status=&kind=)
+  POST /identity/claims/propose     -> same shape as MCP propose_identity_update
+  PATCH /identity/claims/{claim_id} -> {"status": "active"|"rejected"|...}
+  GET  /identity/claims/{claim_id}/edges
+  GET  /identity/summary            -> { "markdown": "..." }
+  GET  /identity/clusters
+  POST /identity/clusters/rebuild   -> run embedding clustering job
+  POST /identity/export             -> write zip under data_dir/exports/
+  GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
-  WS   /events                      -> push: {"type": "source_added|updated|removed", ...}
+  WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
 Run:
   python src/api.py --host 127.0.0.1 --port 8765
@@ -38,12 +48,16 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ingest import ingest_file, _looks_like_chatgpt_export
 from parsers import ALL_KINDS, supported_extensions
 from settings import apply_settings, load_settings, save_settings
 import telemetry
+import identity
+from export_bundle import write_identity_export_zip
+from preference_cluster import run_preference_clustering
 from store import (
     DB_FILENAME,
     connect,
@@ -51,8 +65,12 @@ from store import (
     count_sources,
     delete_source,
     delete_source_by_path,
+    get_chunk,
     get_source,
+    identity_claim_get,
+    identity_edges_for_claim,
     list_sources,
+    preference_clusters_list,
     search as store_search,
 )
 import numpy as np
@@ -151,7 +169,7 @@ def _schedule_broadcast(event: Dict[str, Any]) -> None:
 
 
 _watcher_thread: Optional[threading.Thread] = None
-_watcher_poll_thread: Optional[threading.Thread] = None
+_heartbeat_thread: Optional[threading.Thread] = None
 
 
 def _start_watcher() -> None:
@@ -255,7 +273,7 @@ def _start_watcher() -> None:
             target=_reconcile_bg, name="minion-api-reconcile", daemon=True
         ).start()
 
-        global _watcher_thread, _watcher_poll_thread
+        global _watcher_thread, _heartbeat_thread
         _watcher_thread = start_background(
             _factory, State.inbox, on_event=_on_watcher_event
         )
@@ -270,10 +288,10 @@ def _start_watcher() -> None:
                 except Exception:
                     pass
 
-        _watcher_poll_thread = threading.Thread(
+        _heartbeat_thread = threading.Thread(
             target=_heartbeat, name="minion-api-heartbeat", daemon=True
         )
-        _watcher_poll_thread.start()
+        _heartbeat_thread.start()
     except Exception:
         log.exception("failed to start watcher")
 
@@ -383,6 +401,34 @@ class ConnectBody(BaseModel):
 
 class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
+
+
+class IdentityProposeBody(BaseModel):
+    kind: str
+    text: str
+    source_agent: Optional[str] = None
+    confidence: Optional[float] = None
+    evidence_chunk_ids: Optional[List[str]] = None
+    evidence_rationales: Optional[List[Optional[str]]] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+class IdentityPatchBody(BaseModel):
+    status: str
+    superseded_by: Optional[str] = None
+
+
+class ClusterRebuildBody(BaseModel):
+    sample_limit: int = Field(default=1500, ge=100, le=5000)
+    k: int = Field(default=8, ge=2, le=32)
+    use_llm: bool = True
+
+
+class IdentityExportBody(BaseModel):
+    """Optional path; default writes to `<data_dir>/exports/minion-identity-<ts>.zip`."""
+
+    out_path: Optional[str] = None
+    include_chunk_index: bool = True
 
 
 @app.post("/nuke")
@@ -560,43 +606,6 @@ def delete_endpoint(body: DeleteBody) -> Dict[str, Any]:
     return {"removed_chunks": n}
 
 
-@app.post("/search")
-def search_endpoint(body: SearchBody) -> Dict[str, Any]:
-    model = _get_query_model()
-    vec = np.asarray(next(iter(model.embed([body.query]))), dtype=np.float32)
-    norm = float(np.linalg.norm(vec))
-    if norm > 0:
-        vec = vec / norm
-    hits = store_search(
-        State.conn(),
-        vec,
-        top_k=body.top_k,
-        kind=body.kind,
-        path_glob=body.path_glob,
-        since=body.since,
-        role=body.role,
-    )
-    results = []
-    for h in hits:
-        text = h.text
-        if len(text) > body.max_chars:
-            text = text[: body.max_chars - 1].rstrip() + "…"
-        results.append(
-            {
-                "score": round(h.score, 4),
-                "chunk_id": h.chunk_id,
-                "role": h.role,
-                "source_id": h.source_id,
-                "path": h.path,
-                "kind": h.kind,
-                "mtime": h.mtime,
-                "text": text,
-                "meta": h.meta,
-            }
-        )
-    return {"results": results}
-
-
 _query_model = None
 _query_model_lock = threading.Lock()
 
@@ -616,6 +625,227 @@ def _get_query_model():
         )
         _query_model = TextEmbedding(model_name=name)
         return _query_model
+
+
+def _embed_search_results(
+    query: str,
+    top_k: int,
+    kind: Optional[str],
+    path_glob: Optional[str],
+    since: Optional[float],
+    role: Optional[str],
+    max_chars: int,
+) -> List[Dict[str, Any]]:
+    model = _get_query_model()
+    vec = np.asarray(next(iter(model.embed([query]))), dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+    hits = store_search(
+        State.conn(),
+        vec,
+        top_k=top_k,
+        kind=kind,
+        path_glob=path_glob,
+        since=since,
+        role=role,
+    )
+    results: List[Dict[str, Any]] = []
+    for h in hits:
+        text = h.text
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        results.append(
+            {
+                "score": round(h.score, 4),
+                "chunk_id": h.chunk_id,
+                "role": h.role,
+                "source_id": h.source_id,
+                "path": h.path,
+                "kind": h.kind,
+                "mtime": h.mtime,
+                "text": text,
+                "meta": h.meta,
+            }
+        )
+    return results
+
+
+@app.post("/search")
+def search_endpoint(body: SearchBody) -> Dict[str, Any]:
+    return {
+        "results": _embed_search_results(
+            body.query,
+            body.top_k,
+            body.kind,
+            body.path_glob,
+            body.since,
+            body.role,
+            body.max_chars,
+        )
+    }
+
+
+@app.get("/search/stream")
+def search_stream(
+    query: str,
+    top_k: int = 8,
+    kind: Optional[str] = None,
+    path_glob: Optional[str] = None,
+    role: Optional[str] = None,
+    since: Optional[float] = None,
+    max_chars: int = 600,
+) -> StreamingResponse:
+    """Server-Sent Events stream of semantic search hits (one `hit` event per result)."""
+
+    def gen():
+        try:
+            rows = _embed_search_results(
+                query, top_k, kind, path_glob, since, role, max_chars
+            )
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+            return
+        yield f"event: meta\ndata: {json.dumps({'count': len(rows), 'query': query})}\n\n"
+        for row in rows:
+            yield f"event: hit\ndata: {json.dumps(row)}\n\n"
+        yield f"event: done\ndata: {json.dumps({})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/identity/claims")
+def identity_claims_list(
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    rows, err = identity.list_claims(State.conn(), status=status, kind=kind, limit=limit)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    return {"claims": rows, "count": len(rows)}
+
+
+@app.get("/identity/claims/{claim_id}")
+def identity_claim_detail(claim_id: str) -> Dict[str, Any]:
+    row = identity_claim_get(State.conn(), claim_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="claim not found")
+    return {"claim": row}
+
+
+@app.get("/identity/claims/{claim_id}/edges")
+def identity_claim_edges(claim_id: str) -> Dict[str, Any]:
+    if identity_claim_get(State.conn(), claim_id) is None:
+        raise HTTPException(status_code=404, detail="claim not found")
+    edges = identity_edges_for_claim(State.conn(), claim_id)
+    return {"edges": edges, "count": len(edges)}
+
+
+@app.post("/identity/claims/propose")
+def identity_propose(body: IdentityProposeBody) -> Dict[str, Any]:
+    payload, err = identity.propose_identity_update(
+        State.conn(),
+        kind=body.kind,
+        text=body.text,
+        source_agent=body.source_agent,
+        confidence=body.confidence,
+        evidence_chunk_ids=body.evidence_chunk_ids,
+        evidence_rationales=body.evidence_rationales,
+        meta=body.meta,
+    )
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    assert payload is not None
+    telemetry.log_event("identity_propose", claim_id=payload.get("claim_id"))
+    return payload
+
+
+@app.patch("/identity/claims/{claim_id}")
+def identity_patch_claim(claim_id: str, body: IdentityPatchBody) -> Dict[str, Any]:
+    ok, err = identity.set_claim_status(
+        State.conn(),
+        claim_id,
+        status=body.status,
+        superseded_by=body.superseded_by,
+    )
+    if err:
+        raise HTTPException(status_code=404 if "not found" in (err or "") else 400, detail=err)
+    if not ok:
+        raise HTTPException(status_code=404, detail="claim not found")
+    State.conn().commit()
+    telemetry.log_event(
+        "identity_status",
+        claim_id=claim_id,
+        status=body.status,
+    )
+    row = identity_claim_get(State.conn(), claim_id)
+    return {"claim": row}
+
+
+@app.get("/identity/summary")
+def identity_summary() -> Dict[str, Any]:
+    return {"markdown": identity.build_identity_summary(State.conn())}
+
+
+@app.get("/identity/clusters")
+def identity_clusters() -> Dict[str, Any]:
+    rows = preference_clusters_list(State.conn())
+    return {"clusters": rows, "count": len(rows)}
+
+
+@app.post("/identity/clusters/rebuild")
+def identity_clusters_rebuild(body: ClusterRebuildBody) -> Dict[str, Any]:
+    try:
+        out = run_preference_clustering(
+            State.conn(),
+            sample_limit=body.sample_limit,
+            k=body.k,
+            use_llm=body.use_llm,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+    State.conn().commit()
+    return out
+
+
+@app.post("/identity/export")
+def identity_export(body: IdentityExportBody) -> Dict[str, Any]:
+    if body.out_path:
+        out = Path(body.out_path).expanduser().resolve()
+    else:
+        exp = State.data_dir / "exports"
+        exp.mkdir(parents=True, exist_ok=True)
+        out = exp / f"minion-identity-{int(time.time())}.zip"
+    try:
+        meta = write_identity_export_zip(
+            State.conn(),
+            out_path=out,
+            include_chunk_index=body.include_chunk_index,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+    return meta
+
+
+@app.get("/chunks/{chunk_id}")
+def chunk_detail(chunk_id: str, max_chars: int = 4000) -> Dict[str, Any]:
+    row = get_chunk(State.conn(), chunk_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="chunk not found")
+    text = row["text"]
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return {
+        "chunk_id": row["chunk_id"],
+        "source_id": row["source_id"],
+        "role": row["role"],
+        "path": row["path"],
+        "kind": row["kind"],
+        "mtime": row["mtime"],
+        "text": text,
+        "meta": row["meta"],
+    }
 
 
 def _resolve_file_dest(src_path: Path) -> Path:
