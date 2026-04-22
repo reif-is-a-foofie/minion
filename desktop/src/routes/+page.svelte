@@ -892,7 +892,8 @@
 </svelte:head>
 
 <main class="app" class:dragging>
-  <header>
+  <div class="app-top">
+    <header>
     <div class="brand">
       <img src="/minion.png" alt="" class="brand-icon" />
       <h1>Minion</h1>
@@ -930,61 +931,12 @@
         Settings
       </button>
     </div>
-  </header>
+    </header>
 
-  {#if connectMsg}
-    <div class="toast">{connectMsg}</div>
-  {/if}
-
-  {#if sidecar && sidecar.state !== "ready"}
-    <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
-      <div class="bootstrap-card">
-        <img src="/minion.png" alt="" class="bootstrap-icon" />
-        <div class="bootstrap-hello">Hello, I'm Minion!</div>
-        <div class="bootstrap-title">
-          {#if sidecar.state === "error"}
-            Hmm — that didn't work
-          {:else}
-            Hang tight — I'm almost ready for you…
-          {/if}
-        </div>
-        {#if sidecar.state !== "error"}
-          <p class="bootstrap-tagline">
-            {BOOTSTRAP_TIPS[bootstrapTipIx % BOOTSTRAP_TIPS.length]}
-          </p>
-          {@const curStep = Math.min(bootstrapInferStep(sidecar), 3)}
-          <div class="bootstrap-steps" aria-label="Setup progress">
-            {#each BOOTSTRAP_STEP_LABELS as label, i}
-              <span class="bootstrap-step" class:done={curStep > i} class:current={curStep === i}>
-                {label}
-              </span>
-            {/each}
-          </div>
-          <div class="bootstrap-progress-wrap" aria-hidden="true">
-            <div
-              class="bootstrap-progress-fill"
-              style={`width: ${bootstrapBarPct(sidecar)}%`}
-            ></div>
-            {#if sidecar.state === "installing"}
-              <div class="bootstrap-progress-indeterminate"></div>
-            {/if}
-          </div>
-          <div class="bootstrap-pct-row">
-            <span class="bootstrap-pct">{bootstrapBarPct(sidecar)}%</span>
-            <span class="bootstrap-hint-inline">Only slow once — then we're off to the races.</span>
-          </div>
-        {/if}
-        <div class="bootstrap-msg">
-          {sidecar.message ?? "Hang on…"}
-        </div>
-        {#if sidecar.state !== "error"}
-          <div class="bootstrap-spinner"></div>
-        {:else}
-          <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
-        {/if}
-      </div>
-    </div>
-  {/if}
+    {#if connectMsg}
+      <div class="toast">{connectMsg}</div>
+    {/if}
+  </div>
 
   <section
     class="drop"
@@ -1047,6 +999,56 @@
     </div>
   </section>
 </main>
+
+{#if sidecar && sidecar.state !== "ready"}
+  <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
+    <div class="bootstrap-card">
+      <img src="/minion.png" alt="" class="bootstrap-icon" />
+      <div class="bootstrap-hello">Hello, I'm Minion!</div>
+      <div class="bootstrap-title">
+        {#if sidecar.state === "error"}
+          Hmm — that didn't work
+        {:else}
+          Hang tight — I'm almost ready for you…
+        {/if}
+      </div>
+      {#if sidecar.state !== "error"}
+        <p class="bootstrap-tagline">
+          {BOOTSTRAP_TIPS[bootstrapTipIx % BOOTSTRAP_TIPS.length]}
+        </p>
+        {@const curStep = Math.min(bootstrapInferStep(sidecar), 3)}
+        <div class="bootstrap-steps" aria-label="Setup progress">
+          {#each BOOTSTRAP_STEP_LABELS as label, i}
+            <span class="bootstrap-step" class:done={curStep > i} class:current={curStep === i}>
+              {label}
+            </span>
+          {/each}
+        </div>
+        <div class="bootstrap-progress-wrap" aria-hidden="true">
+          <div
+            class="bootstrap-progress-fill"
+            style={`width: ${bootstrapBarPct(sidecar)}%`}
+          ></div>
+          {#if sidecar.state === "installing"}
+            <div class="bootstrap-progress-indeterminate"></div>
+          {/if}
+        </div>
+        <div class="bootstrap-pct-row">
+          <span class="bootstrap-pct">{bootstrapBarPct(sidecar)}%</span>
+          <span class="bootstrap-hint-inline">Only slow once — then we're off to the races.</span>
+        </div>
+      {/if}
+      <div class="bootstrap-msg">
+        {sidecar.message ?? "Hang on…"}
+      </div>
+      {#if sidecar.state !== "error"}
+        <div class="bootstrap-spinner"></div>
+      {:else}
+        <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 {#if showSettings}
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
@@ -1340,15 +1342,27 @@
   .app > * { position: relative; z-index: 1; }
 
   .app {
+    box-sizing: border-box;
     height: 100vh;
+    max-height: 100vh;
+    overflow: hidden;
     display: grid;
-    grid-template-rows: auto auto 1fr;
+    grid-template-rows: auto auto minmax(0, 1fr);
     gap: 16px;
     padding: 20px 28px 24px;
     max-width: 820px;
     margin: 0 auto;
     font-size: 13px;
     color: var(--ink);
+  }
+
+  /* One grid row for header + optional toast — otherwise toast steals the flexible row
+   * and the drop zone grows instead of Activity. */
+  .app-top {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
   }
 
   header {
@@ -1718,6 +1732,8 @@
   /* Drop zone: a warm welcoming surface with a soft breathing halo.
    * This is where the user "greets" Minion — it should feel alive. */
   .drop {
+    align-self: start;
+    width: 100%;
     position: relative;
     border: 1px solid var(--border-strong);
     background: var(--panel);
@@ -1837,11 +1853,11 @@
   }
   /* Terminal: a warm scrolling log. One line per event. */
   .term {
+    min-height: 0;
     background: var(--panel);
     border: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    min-height: 0;
     overflow: hidden;
     border-radius: var(--radius);
     font-family: var(--mono-font);

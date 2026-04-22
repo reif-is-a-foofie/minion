@@ -216,6 +216,15 @@ def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Con
 
     conn = sqlite3.connect(str(db_path), timeout=_SQLITE_LOCK_WAIT_S)
     conn.row_factory = sqlite3.Row
+    # Python 3.12+ defaults autocommit=False: every execute opens an implicit
+    # transaction until commit(). Our DAO uses explicit BEGIN/COMMIT via
+    # transaction() — that raises "cannot start a transaction within a
+    # transaction" if a prior SELECT (e.g. get_embed_dim) left the implicit txn
+    # open. Legacy autocommit matches pre-3.12 behaviour.
+    try:
+        conn.autocommit = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
     _load_vec_extension(conn)
 
     conn.execute("PRAGMA journal_mode=WAL")
