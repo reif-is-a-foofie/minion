@@ -8,10 +8,15 @@ by passing `parser=...` when calling `parse_file`.
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+from parser_extensions import load_manifest_file, manifest_path
+
+log = logging.getLogger("minion.parsers")
 
 
 @dataclass
@@ -115,9 +120,39 @@ _CODE_EXT = {
 for _ext in _CODE_EXT:
     _EXT_REGISTRY[_ext] = ("code", "parsers.code", "parse")
 
+# Filled from ``<data_dir>/parser_extensions.json`` via ``load_user_extensions``.
+_USER_EXT_REGISTRY: Dict[str, Tuple[str, str, str]] = {}
+
 
 def supported_extensions() -> List[str]:
-    return sorted(_EXT_REGISTRY.keys())
+    return sorted(set(_EXT_REGISTRY.keys()) | set(_USER_EXT_REGISTRY.keys()))
+
+
+def load_user_extensions(data_dir: Path) -> int:
+    """Merge user extension manifest into the runtime registry. Returns count added."""
+    global _USER_EXT_REGISTRY
+    _USER_EXT_REGISTRY = {}
+    path = manifest_path(Path(data_dir))
+    loaded = load_manifest_file(path)
+    added = 0
+    for suf, spec in loaded.items():
+        if suf in _EXT_REGISTRY:
+            log.warning(
+                "parser_extensions: suffix %s is built-in; user mapping ignored", suf
+            )
+            continue
+        _USER_EXT_REGISTRY[suf] = spec
+        added += 1
+    return added
+
+
+def user_extension_mappings() -> Dict[str, Tuple[str, str, str]]:
+    return dict(_USER_EXT_REGISTRY)
+
+
+def reload_user_extensions(data_dir: Path) -> int:
+    """Public alias for tests and ``POST /extensions/reload``."""
+    return load_user_extensions(data_dir)
 
 
 # Canonical list of user-togglable kinds (surfaced in the UI settings pane).
@@ -132,6 +167,7 @@ ALL_KINDS: Tuple[str, ...] = (
     "video",
     "code",
     "chatgpt-export",
+    "external",
 )
 
 # Kinds the user has opted out of. Runtime only; persisted by settings.py.
@@ -164,6 +200,8 @@ def choose_parser(path: Path) -> Optional[Tuple[str, str, str]]:
     suffix = path.suffix.lower()
     if suffix in _EXT_REGISTRY:
         return _EXT_REGISTRY[suffix]
+    if suffix in _USER_EXT_REGISTRY:
+        return _USER_EXT_REGISTRY[suffix]
 
     mime, _ = mimetypes.guess_type(str(path))
     if mime:

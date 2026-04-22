@@ -7,9 +7,13 @@ and model load.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -18,7 +22,15 @@ from typing import Any, Callable, Dict
 
 import numpy as np
 
-from parsers import ParseResult, UnsupportedFile, is_disabled_kind, kind_for, parse_file
+from parsers import (
+    ALL_KINDS,
+    ParseResult,
+    UnsupportedFile,
+    disabled_kinds,
+    is_disabled_kind,
+    kind_for,
+    parse_file,
+)
 from store import sha256_of_file, upsert_source
 import telemetry
 
@@ -231,6 +243,130 @@ def _embed(
         i += len(batch)
         on_progress("embed", {"done": i, "total": total})
     return np.concatenate(out, axis=0)
+
+
+_MAX_WEBHOOK_CHUNKS = 2_000
+_MAX_WEBHOOK_CHUNK_CHARS = 100_000
+_MAX_WEBHOOK_TOTAL_CHARS = 4_000_000
+
+
+def _stream_logical_path(data_dir: Path, source_key: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._@-]+", "_", source_key.strip())[:220].strip("._") or "stream"
+    return str((Path(data_dir) / "__minion_stream__" / safe).resolve())
+
+
+def _payload_digest(source_key: str, chunks_payload: List[Dict[str, Any]]) -> str:
+    h = hashlib.sha256()
+    h.update(source_key.encode("utf-8"))
+    h.update(b"\0")
+    h.update(json.dumps(chunks_payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return h.hexdigest()
+
+
+def ingest_webhook_payload(
+    conn: sqlite3.Connection,
+    data_dir: Path,
+    *,
+    source_key: str,
+    display_name: Optional[str],
+    kind: str,
+    parser: str,
+    chunks: List[Dict[str, Any]],
+    force: bool = False,
+    on_progress: ProgressFn = _noop,
+) -> IngestResult:
+    """Parse-free ingest: embed JSON chunks (webhook / automation)."""
+    sk = source_key.strip()
+    if not sk:
+        return IngestResult("", None, "?", "?", 0, True, reason="empty source_key")
+
+    k = (kind or "external").strip()
+    if k not in ALL_KINDS:
+        return IngestResult("", None, k, parser, 0, True, reason=f"unknown kind {k!r}")
+    if k in disabled_kinds():
+        return IngestResult("", None, k, parser, 0, True, reason=f"disabled kind {k}")
+
+    if len(chunks) > _MAX_WEBHOOK_CHUNKS:
+        return IngestResult("", None, k, parser, 0, True, reason="too many chunks")
+
+    total_chars = 0
+    norm_chunks: List[tuple[str, Optional[str], Dict[str, Any]]] = []
+    for i, c in enumerate(chunks):
+        if not isinstance(c, dict):
+            return IngestResult("", None, k, parser, 0, True, reason=f"chunk {i} not an object")
+        text = c.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return IngestResult("", None, k, parser, 0, True, reason=f"chunk {i} missing text")
+        if len(text) > _MAX_WEBHOOK_CHUNK_CHARS:
+            return IngestResult("", None, k, parser, 0, True, reason=f"chunk {i} too large")
+        total_chars += len(text)
+        if total_chars > _MAX_WEBHOOK_TOTAL_CHARS:
+            return IngestResult("", None, k, parser, 0, True, reason="payload too large")
+        role = c.get("role")
+        if role is not None and not isinstance(role, str):
+            role = str(role)
+        meta = c.get("meta") if isinstance(c.get("meta"), dict) else {}
+        norm_chunks.append((text, role, meta))
+
+    logical = _stream_logical_path(data_dir, sk)
+    digest = _payload_digest(sk, chunks)
+
+    if not force:
+        row = conn.execute("SELECT sha256 FROM sources WHERE path=?", (logical,)).fetchone()
+        if row and row["sha256"] == digest:
+            return IngestResult(logical, None, k, parser, 0, True, reason="unchanged")
+
+    on_progress("parse_start", {"suffix": "(webhook)", "bytes": total_chars})
+    on_progress("parsed", {"chunks": len(norm_chunks), "kind": k, "parser": parser})
+
+    name = os.environ.get("MINION_EMBED_MODEL", DEFAULT_MODEL)
+    model = _get_model(name)
+    texts = [t for t, _, _ in norm_chunks]
+    embeddings = _embed(model, texts, on_progress=on_progress)
+
+    source_meta: Dict[str, Any] = {
+        "stream_source_key": sk,
+        "display_name": display_name or sk,
+        "ingest_route": "webhook",
+        "model_name": name,
+    }
+
+    source_id = upsert_source(
+        conn,
+        path=logical,
+        kind=k,
+        sha256=digest,
+        mtime=time.time(),
+        bytes_=total_chars,
+        parser=parser,
+        source_meta=source_meta,
+        chunks=norm_chunks,
+        embeddings=embeddings,
+    )
+
+    try:
+        telemetry.log_event(
+            "ingest",
+            path=logical,
+            file_kind=k,
+            parser=parser,
+            chunks=len(norm_chunks),
+            skipped=False,
+            reason=None,
+            result="ingested",
+            source_id=source_id,
+        )
+    except Exception:
+        pass
+
+    return IngestResult(
+        path=logical,
+        source_id=source_id,
+        kind=k,
+        parser=parser,
+        chunk_count=len(norm_chunks),
+        skipped=False,
+    )
 
 
 def ingest_file(

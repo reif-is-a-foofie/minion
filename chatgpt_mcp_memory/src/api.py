@@ -24,6 +24,9 @@ Endpoints:
   GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
   GET  /capabilities                -> stable feature flags for local agent integrations
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
+  POST /ingest/webhook              -> JSON or NDJSON chunks (Bearer when MINION_API_TOKEN set)
+  GET  /extensions                  -> parser_extensions.json schema + webhook docs
+  POST /extensions/reload           -> re-read parser_extensions.json
   POST /reconcile                   -> body: {"force": bool}  rescan inbox → DB (optional re-embed all)
   WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
@@ -52,10 +55,11 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from ingest import ingest_file, _looks_like_chatgpt_export
-from parsers import ALL_KINDS, supported_extensions
+from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_export
+from parser_extensions import manifest_path
+from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_extension_mappings
 from settings import apply_settings, load_settings, save_settings
 import telemetry
 import identity
@@ -371,6 +375,12 @@ async def _lifespan(app: FastAPI):
         apply_settings(load_settings(State.data_dir))
     except Exception:
         log.exception("failed to load settings")
+    try:
+        n_ext = load_user_extensions(State.data_dir)
+        if n_ext:
+            log.info("parser_extensions: loaded %s user mapping(s)", n_ext)
+    except Exception:
+        log.exception("failed to load parser_extensions.json")
     _start_watcher()
     # Nudge Claude Desktop to re-read our tool descriptions + retrieval policy
     # whenever the MCP-relevant sources have changed since last launch. No-op
@@ -418,6 +428,27 @@ class IngestBody(BaseModel):
     path: str
     move: bool = False  # if True, move into inbox; else copy
     recursive: bool = True  # used when `path` is a directory
+
+
+class WebhookChunk(BaseModel):
+    text: str = Field(..., min_length=1)
+    role: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class IngestWebhookBody(BaseModel):
+    source_key: str = Field(..., min_length=1, max_length=200)
+    display_name: Optional[str] = Field(None, max_length=500)
+    kind: str = Field(default="external", max_length=64)
+    parser: str = Field(default="webhook", max_length=64)
+    chunks: List[WebhookChunk] = Field(..., min_length=1)
+
+    @field_validator("chunks")
+    @classmethod
+    def cap_chunks(cls, v: List[WebhookChunk]) -> List[WebhookChunk]:
+        if len(v) > 2000:
+            raise ValueError("at most 2000 chunks per request")
+        return v
 
 
 SKIP_DIR_NAMES = {
@@ -675,6 +706,9 @@ def capabilities() -> Dict[str, Any]:
             "search": "POST /search",
             "search_stream": "GET /search/stream",
             "ingest": "POST /ingest",
+            "ingest_webhook": "POST /ingest/webhook",
+            "extensions": "GET /extensions",
+            "extensions_reload": "POST /extensions/reload",
             "reconcile": "POST /reconcile",
             "events_ws": "WS /events",
             "identity_claims": "GET /identity/claims",
@@ -683,6 +717,55 @@ def capabilities() -> Dict[str, Any]:
             "clusters_rebuild": "POST /identity/clusters/rebuild",
         },
     }
+
+
+@app.get("/extensions")
+def extensions_get() -> Dict[str, Any]:
+    """Describe user parser mappings + webhook ingest (no secrets)."""
+    return {
+        "manifest_path": str(manifest_path(State.data_dir)),
+        "user_extensions": [
+            {"suffix": k, "kind": v[0], "module": v[1], "function": v[2]}
+            for k, v in sorted(user_extension_mappings().items())
+        ],
+        "supported_extensions": supported_extensions(),
+        "parser_manifest_schema": {
+            "version": 1,
+            "extensions": [
+                {
+                    "suffix": ".proto",
+                    "kind": "code",
+                    "module": "parsers.code",
+                    "function": "parse",
+                }
+            ],
+            "note": "module must start with parsers. — maps new suffixes to in-tree parsers only.",
+        },
+        "ingest_webhook": {
+            "method": "POST",
+            "path": "/ingest/webhook",
+            "json_body": {
+                "source_key": "stable id (e.g. slack:channel-123)",
+                "display_name": "optional",
+                "kind": "external | text | … (must be a known ALL_KINDS value)",
+                "parser": "webhook (default)",
+                "chunks": [{"text": "…", "role": null, "meta": {}}],
+            },
+            "ndjson": {
+                "content_type": "application/x-ndjson",
+                "query": "source_key required",
+                "lines": 'each line JSON: {"text":"…","role":null,"meta":{}}',
+            },
+            "auth": "Bearer MINION_API_TOKEN when MINION_API_TOKEN is set",
+        },
+    }
+
+
+@app.post("/extensions/reload")
+def extensions_reload() -> Dict[str, Any]:
+    """Re-read ``parser_extensions.json`` from the data directory."""
+    n = load_user_extensions(State.data_dir)
+    return {"reloaded": n, "manifest_path": str(manifest_path(State.data_dir))}
 
 
 @app.get("/sources")
@@ -1275,6 +1358,75 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
 
     asyncio.create_task(_run_ingest())
     return {"queued": str(dest), "kind": "file"}
+
+
+@app.post("/ingest/webhook")
+async def ingest_webhook(request: Request) -> Dict[str, Any]:
+    """Ingest pre-chunked JSON (Zapier, Slack bridge, custom scripts).
+
+    JSON body: :class:`IngestWebhookBody`. For line-delimited JSON set
+    ``Content-Type: application/x-ndjson`` and pass ``?source_key=…``.
+    """
+    ct = (request.headers.get("content-type") or "").lower()
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty body")
+
+    if "ndjson" in ct or "x-ndjson" in ct:
+        sk = (request.query_params.get("source_key") or "").strip()
+        if not sk:
+            raise HTTPException(
+                status_code=400,
+                detail="NDJSON mode requires ?source_key=your_stable_id",
+            )
+        rows: List[Dict[str, Any]] = []
+        for line in raw.decode("utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"ndjson: {e}") from e
+            if not isinstance(obj, dict):
+                raise HTTPException(status_code=400, detail="each NDJSON line must be a JSON object")
+            rows.append(obj)
+        body = IngestWebhookBody(
+            source_key=sk,
+            display_name=None,
+            kind="external",
+            parser="webhook-ndjson",
+            chunks=[WebhookChunk.model_validate(c) for c in rows],
+        )
+    else:
+        try:
+            body = IngestWebhookBody.model_validate_json(raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    conn = State.conn()
+    res = ingest_webhook_payload(
+        conn,
+        State.data_dir,
+        source_key=body.source_key,
+        display_name=body.display_name,
+        kind=body.kind,
+        parser=body.parser,
+        chunks=[c.model_dump(mode="json") for c in body.chunks],
+        force=False,
+    )
+    res_dict: Dict[str, Any] = {
+        "path": res.path,
+        "source_id": res.source_id,
+        "kind": res.kind,
+        "parser": res.parser,
+        "chunk_count": res.chunk_count,
+        "skipped": res.skipped,
+        "reason": res.reason,
+    }
+    ev = "ingest_skipped" if res.skipped or not res.source_id else "source_updated"
+    _schedule_broadcast({"type": ev, "result": res_dict, "counts": _counts()})
+    return {"ok": True, **res_dict}
 
 
 # ---------------------------------------------------------------------------

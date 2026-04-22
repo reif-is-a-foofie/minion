@@ -11,7 +11,9 @@
     fetchChunk,
     fetchIdentityClaimEdges,
     fetchIdentityClaims,
+    fetchExtensions,
     fetchSettings,
+    reloadParserExtensions,
     fetchSources,
     fetchStatus,
     getConfig,
@@ -31,6 +33,7 @@
     type Active,
     type AppConfig,
     type ConnState,
+    type ExtensionsInfo,
     type IdentityClaim,
     type SearchHit,
     type SidecarStatus,
@@ -112,6 +115,7 @@
     if (nav === "library") await refreshSources();
     if (nav === "identity") await refreshIdentity();
     if (nav === "ingest" && !settingsLoaded) await loadSettings();
+    if (nav === "ingest" && !extensionsInfo && !extensionsLoading) void loadExtensionsInfo();
   }
 
   async function openSettings(nav?: SettingsNav) {
@@ -317,6 +321,7 @@
     video:            "video files (transcribed + keyframe OCR)",
     code:             "source code in any supported language",
     "chatgpt-export": "full chatgpt / claude archive exports",
+    external:         "webhook / API pushes (POST /ingest/webhook)",
   };
 
   async function loadSettings() {
@@ -376,7 +381,39 @@
     video: "Video",
     code: "Code",
     "chatgpt-export": "ChatGPT",
+    external: "API",
   };
+
+  let extensionsInfo = $state<ExtensionsInfo | null>(null);
+  let extensionsLoading = $state(false);
+  let extensionsErr = $state<string | null>(null);
+
+  async function loadExtensionsInfo() {
+    extensionsLoading = true;
+    extensionsErr = null;
+    try {
+      extensionsInfo = await fetchExtensions();
+    } catch (e) {
+      extensionsErr = (e as Error).message ?? String(e);
+      extensionsInfo = null;
+    } finally {
+      extensionsLoading = false;
+    }
+  }
+
+  async function reloadExtensionsFromDisk() {
+    extensionsLoading = true;
+    extensionsErr = null;
+    try {
+      await reloadParserExtensions();
+      extensionsInfo = await fetchExtensions();
+      pushFeed("settings", `parser_extensions.json reloaded (${extensionsInfo.user_extensions.length} mapping(s))`);
+    } catch (e) {
+      extensionsErr = (e as Error).message ?? String(e);
+    } finally {
+      extensionsLoading = false;
+    }
+  }
 
   /** Turn `404 Not Found: {"detail":"…"}` into a short line for Settings and toasts. */
   function formatHttpErrorMessage(msg: string): string {
@@ -1207,6 +1244,43 @@
                   <button type="button" class="ghost" onclick={() => void runRescanInbox(true)} disabled={rescanning || conn !== "open"}>Re-index all</button>
                 </div>
               </div>
+              <div class="section-title small ingest-types-head">
+                Extensions &amp; webhooks
+              </div>
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Custom file types</div>
+                  <div class="setting-desc">
+                    Add <span class="mono">parser_extensions.json</span> next to <span class="mono">memory.db</span> (see
+                    <span class="mono">GET /extensions</span> for schema). Maps new suffixes to built-in
+                    <span class="mono">parsers.*</span> modules only.
+                  </div>
+                  {#if extensionsInfo?.manifest_path}
+                    <div class="path-one-line mono" title={extensionsInfo.manifest_path}>{extensionsInfo.manifest_path}</div>
+                  {/if}
+                  {#if extensionsErr}
+                    <p class="settings-error-detail">{extensionsErr}</p>
+                  {/if}
+                </div>
+                <div class="setting-actions">
+                  <button type="button" class="ghost" onclick={() => void loadExtensionsInfo()} disabled={extensionsLoading}
+                    >{extensionsLoading ? "…" : "Refresh"}</button
+                  >
+                  <button type="button" class="ghost" onclick={() => void reloadExtensionsFromDisk()} disabled={extensionsLoading}
+                    >Reload file</button
+                  >
+                </div>
+              </div>
+              {#if extensionsInfo && extensionsInfo.user_extensions.length > 0}
+                <ul class="kind-list">
+                  {#each extensionsInfo.user_extensions as row}
+                    <li class="kind-row">
+                      <span class="mono">{row.suffix}</span>
+                      <span class="kind-desc">→ {row.module}.{row.function} ({row.kind})</span>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
               <div class="section-title small ingest-types-head">
                 File types
                 <span class="section-hint">{savingSettings ? "saving…" : "what Minion ingests"}</span>

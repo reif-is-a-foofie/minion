@@ -546,6 +546,22 @@ export type SettingsResponse = {
   all_kinds: string[];
 };
 
+export type ExtensionsInfo = {
+  manifest_path: string;
+  user_extensions: { suffix: string; kind: string; module: string; function: string }[];
+  supported_extensions: string[];
+  parser_manifest_schema: { version: number; extensions: unknown[]; note?: string };
+  ingest_webhook: Record<string, unknown>;
+};
+
+export async function fetchExtensions(): Promise<ExtensionsInfo> {
+  return apiFetch<ExtensionsInfo>("/extensions");
+}
+
+export async function reloadParserExtensions(): Promise<{ reloaded: number; manifest_path: string }> {
+  return apiFetch("/extensions/reload", { method: "POST" });
+}
+
 export async function fetchSettings(): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/settings");
 }
