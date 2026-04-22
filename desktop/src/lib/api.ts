@@ -62,6 +62,12 @@ export type Active = {
   skipped: number;
 };
 
+export type DatabaseStatus = {
+  ok: boolean;
+  error: string | null;
+  journal_mode: string | null;
+};
+
 export type Status = {
   data_dir: string;
   inbox: string;
@@ -69,6 +75,8 @@ export type Status = {
   supported_extensions: string[];
   counts: { sources: number; chunks: number };
   active: Active;
+  /** Present on newer sidecars; when ok is false, ingest/search are blocked. */
+  database?: DatabaseStatus;
   watcher: { running: boolean; mode?: string };
 };
 
@@ -83,7 +91,8 @@ export type EventMsg =
   | { type: "ingest_failed"; path: string; active?: Active }
   | { type: "source_updated"; result: Record<string, unknown>; counts: any; active?: Active }
   | { type: "source_removed"; key: string; counts: any }
-  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
+  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any }
+  | { type: "db_error"; message: string };
 
 /** Always ask the Rust shell — never cache. Stale `api_base` after a port
  * change or sidecar restart caused POST /nuke to hit the wrong listener (404). */
