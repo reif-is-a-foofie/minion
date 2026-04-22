@@ -62,13 +62,13 @@
   let sidecar = $state<SidecarStatus | null>(null);
 
   const BOOTSTRAP_TIPS = [
-    "Drop files here and I'll remember them for every agent you use.",
-    "First launch downloads the heavy stuff — embeddings, parsers, the works. It only happens once.",
-    "Your library lives on this machine; nothing ships to us when you search.",
-    "I fuse semantic search with keywords so good hits don't hide at rank six.",
+    "Drop a file here anytime — I'll hold onto it for you.",
+    "The first open takes a few minutes while I unpack my tools. After that, I'm quick.",
+    "Everything stays on your computer. Your stuff is yours.",
+    "Ask me about your files in plain English — I'll dig up what matters.",
   ];
 
-  const BOOTSTRAP_STEP_LABELS = ["Say hello", "Python setup", "Install brains", "Wake server"];
+  const BOOTSTRAP_STEP_LABELS = ["Hi there", "Getting ready", "Gathering tools", "Almost open"];
 
   function bootstrapInferStep(s: SidecarStatus): number {
     if (typeof s.step === "number") return Math.max(0, Math.min(4, s.step));
@@ -152,7 +152,7 @@
   /** WKWebView often surfaces connection refused as the useless string "Load failed". */
   function humanizeSettingsLoadError(msg: string): string {
     if (msg === "Load failed" || /^failed to fetch$/i.test(msg.trim())) {
-      return "The sidecar is not up yet — wait for first-run setup to finish, then Retry or use Restart above.";
+      return "I'm still finishing first-time setup — wait a bit, then tap Retry or Restart above.";
     }
     return msg;
   }
@@ -460,16 +460,16 @@
       return `${head} — change in Settings`;
     }
     if (/no module named ['"]faster_whisper['"]/i.test(reason)) {
-      return "Skipping audio/video transcript (install faster-whisper in the sidecar venv)";
+      return "Skipping audio for now — the add-on for voice and video isn't on this machine yet.";
     }
     if (/no module named ['"]docx['"]/i.test(reason)) {
-      return "Skipping Word docs (pip install python-docx — then restart sidecar)";
+      return "Skipping Word files for now — the add-on for .docx isn't here. Try Settings → Restart after updates.";
     }
     if (/missing-deps:.*pypdf|missing-deps:.*requirements/i.test(reason)) {
-      return "Skipping PDF (sidecar venv missing PDF libs — see Settings → File logs / pip-bootstrap.log; delete data/venv and relaunch)";
+      return "Skipping this PDF — the first-time install may be incomplete. See Settings → File logs.";
     }
     if (/missing-deps:/i.test(reason)) {
-      return "Skipping PDF (fix sidecar deps — see Settings → File logs; delete data/venv and relaunch)";
+      return "Skipping this file — the first-time install may be incomplete. See Settings → File logs.";
     }
     const one = reason.replace(/^parse-error:\s*/i, "").trim();
     const short = one.length > 80 ? `${one.slice(0, 77)}…` : one;
@@ -907,12 +907,12 @@
       <span
         class="status-pill status-{conn}"
         title={conn === "open"
-          ? `Sidecar ready · ${config?.api_base ?? ""}`
+          ? `Ready · ${config?.api_base ?? ""}`
           : conn === "connecting"
-            ? "Connecting to sidecar…"
+            ? "Connecting…"
             : conn === "unreachable"
-              ? "Sidecar unreachable. Check that Python 3.10+ is installed and click Settings → Restart."
-              : "Sidecar restarting…"}
+              ? "Can't reach Minion's engine — wait for setup or use Settings → Restart."
+              : "Reconnecting…"}
       >
         <span class="status-dot"></span>
         {conn === "open"
@@ -940,12 +940,12 @@
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
       <div class="bootstrap-card">
         <img src="/minion.png" alt="" class="bootstrap-icon" />
-        <div class="bootstrap-hello">Hello, Minion</div>
+        <div class="bootstrap-hello">Hello, I'm Minion!</div>
         <div class="bootstrap-title">
           {#if sidecar.state === "error"}
-            Can't start yet
+            Hmm — that didn't work
           {:else}
-            Getting your memory online…
+            Hang tight — I'm almost ready for you…
           {/if}
         </div>
         {#if sidecar.state !== "error"}
@@ -971,11 +971,11 @@
           </div>
           <div class="bootstrap-pct-row">
             <span class="bootstrap-pct">{bootstrapBarPct(sidecar)}%</span>
-            <span class="bootstrap-hint-inline">First launch only — then you're fast forever.</span>
+            <span class="bootstrap-hint-inline">Only slow once — then we're off to the races.</span>
           </div>
         {/if}
         <div class="bootstrap-msg">
-          {sidecar.message ?? "Working…"}
+          {sidecar.message ?? "Hang on…"}
         </div>
         {#if sidecar.state !== "error"}
           <div class="bootstrap-spinner"></div>
@@ -1075,7 +1075,7 @@
             class="ghost"
             onclick={handleRestart}
             disabled={restarting}
-            title="Kill and respawn the Python sidecar"
+            title="Restart Minion's background helper"
           >
             {restarting ? "restarting…" : "Restart"}
           </button>
@@ -1127,8 +1127,8 @@
             <div class="setting-main">
               <div class="setting-label">File logs</div>
               <div class="setting-desc path-hint">
-                Release builds write the Python sidecar and shell diagnostics under
-                <code>logs/</code> next to your index (dev builds keep the sidecar in this terminal).
+                Full builds save troubleshooting logs under <code>logs/</code> next to your stuff.
+                When you run from a terminal in dev, extra chatter stays in that window instead.
               </div>
               <pre class="path-block">{config.desktop_log}</pre>
               <pre class="path-block">{config.sidecar_log}</pre>
@@ -1154,7 +1154,7 @@
         </div>
         {#if !settingsLoaded && settingsError}
           <div class="empty">
-            Couldn't reach the sidecar: {humanizeSettingsLoadError(settingsError)}{" "}
+            Couldn't load settings: {humanizeSettingsLoadError(settingsError)}{" "}
             <button class="link" onclick={loadSettings}>Retry</button>
           </div>
         {:else if !settingsLoaded}
@@ -1163,7 +1163,7 @@
               Waiting for setup…
               {#if sidecar.message}<div class="setting-desc">{sidecar.message}</div>{/if}
             {:else}
-              Connecting to the sidecar…
+              Connecting…
             {/if}
           </div>
         {:else}
@@ -1187,8 +1187,7 @@
             {/each}
           </ul>
           <div class="settings-note">
-            Files of disabled kinds are left alone on disk — Minion will log
-            them as skipped. Re-enable and restart the sidecar to pick them up.
+            Files you turn off stay untouched — I'll note them as skipped. Turn a kind back on and use Restart if you change your mind.
           </div>
         {/if}
       </div>

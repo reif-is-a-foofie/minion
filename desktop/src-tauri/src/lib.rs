@@ -556,7 +556,7 @@ fn bootstrap_venv_with_managed_uv(
     emit_sidecar_status(
         app,
         "bootstrapping",
-        Some("Downloading Python (bundled installer — needs network, first launch only)…"),
+        Some("Fetching the engine I need to run on your Mac — first time only, needs internet…"),
         1,
     );
 
@@ -566,17 +566,23 @@ fn bootstrap_venv_with_managed_uv(
         .env("UV_PYTHON_INSTALL_DIR", &install_dir);
     forward_proxy_env(&mut cmd_install);
     let st = cmd_install.status().map_err(|e| {
-        let msg = format!("uv python install failed to start: {e}");
-        emit_sidecar_error(app, &msg);
-        msg
+        let detail = format!("uv python install failed to start: {e}");
+        emit_sidecar_error(
+            app,
+            "Couldn't start the download. Check your connection — Settings → File logs has details.",
+        );
+        detail
     })?;
     if !st.success() {
-        let msg = format!(
-            "Downloading Python failed (uv exit {}). Check network or set HTTP_PROXY; see logs.",
+        let detail = format!(
+            "uv python install exit {}",
             st.code().unwrap_or(-1)
         );
-        emit_sidecar_error(app, &msg);
-        return Err(msg);
+        emit_sidecar_error(
+            app,
+            "Couldn't finish downloading what I need. Are you online? If you use a proxy, set HTTP_PROXY — File logs has more.",
+        );
+        return Err(detail);
     }
 
     let venv_dir = data_dir.join("venv");
@@ -587,7 +593,7 @@ fn bootstrap_venv_with_managed_uv(
     emit_sidecar_status(
         app,
         "bootstrapping",
-        Some("Creating virtual environment…"),
+        Some("Making a little workspace just for me…"),
         1,
     );
     let mut cmd_venv = Command::new(uv);
@@ -602,17 +608,14 @@ fn bootstrap_venv_with_managed_uv(
         .env("UV_PYTHON_INSTALL_DIR", &install_dir);
     forward_proxy_env(&mut cmd_venv);
     let st2 = cmd_venv.status().map_err(|e| {
-        let msg = format!("uv venv failed to start: {e}");
-        emit_sidecar_error(app, &msg);
-        msg
+        let detail = format!("uv venv failed to start: {e}");
+        emit_sidecar_error(app, "Couldn't finish setting up my workspace. File logs has the technical bits.");
+        detail
     })?;
     if !st2.success() {
-        let msg = format!(
-            "venv creation failed (uv exit {}).",
-            st2.code().unwrap_or(-1)
-        );
-        emit_sidecar_error(app, &msg);
-        return Err(msg);
+        let detail = format!("venv creation failed (exit {}).", st2.code().unwrap_or(-1));
+        emit_sidecar_error(app, "Couldn't finish setting up my workspace. Try again — File logs has details.");
+        return Err(detail);
     }
 
     dbg(
@@ -661,7 +664,7 @@ fn bootstrap_venv_impl(
         );
         emit(
             "bootstrapping",
-            "Repairing Python environment (pip was missing)…",
+            "Redoing setup — something didn't finish cleanly last time…",
             1,
         );
         fs::remove_dir_all(&venv_dir).map_err(|e| {
@@ -669,7 +672,10 @@ fn bootstrap_venv_impl(
                 "Could not remove incomplete venv at {}: {e}",
                 venv_dir.display()
             );
-            emit_sidecar_error(app, &msg);
+            emit_sidecar_error(
+                app,
+                "Couldn't clear my old workspace folder — check permissions or File logs.",
+            );
             shell_log("ERROR", &msg);
             msg
         })?;
@@ -688,7 +694,7 @@ fn bootstrap_venv_impl(
                 serde_json::json!({"system_python": system_py, "version": ver}),
             );
             if !py.exists() {
-                emit("bootstrapping", "Creating Python environment…", 1);
+                emit("bootstrapping", "Creating a cozy spot on your Mac where I can work…", 1);
                 let status = Command::new(&system_py)
                     .arg("-m")
                     .arg("venv")
@@ -696,13 +702,13 @@ fn bootstrap_venv_impl(
                     .status()
                     .map_err(|e| {
                         let msg = format!("venv launch failed: {e}");
-                        emit_sidecar_error(app, &msg);
+                        emit_sidecar_error(app, "Couldn't create my workspace — File logs may explain why.");
                         msg
                     })?;
                 if !status.success() {
                     let msg =
                         format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
-                    emit_sidecar_error(app, &msg);
+                    emit_sidecar_error(app, "Couldn't create my workspace — quit and try again, or check File logs.");
                     dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
                     return Err(msg);
                 }
@@ -728,8 +734,13 @@ fn bootstrap_venv_impl(
         None => {
             dbg("bootstrap", serde_json::json!({"state": "no_system_python"}));
             let uv = resolve_bundled_uv(app).ok_or_else(|| {
-                let msg = "Python was not found and the bundled installer (uv) is missing from this app. Reinstall Minion, or install Python 3.10+ from python.org and relaunch.".to_string();
-                emit_sidecar_error(app, &msg);
+                let msg =
+                    "Python missing and bundled helper not found — reinstall Minion or install Python 3.12+."
+                        .to_string();
+                emit_sidecar_error(
+                    app,
+                    "This copy of Minion seems incomplete — reinstall the app. Or install Python from python.org and try again.",
+                );
                 msg
             })?;
             bootstrap_venv_with_managed_uv(app, data_dir, &uv)?;
@@ -741,13 +752,16 @@ fn bootstrap_venv_impl(
             "venv Python missing at {} after setup — try deleting the venv folder and relaunch.",
             py.display()
         );
-        emit_sidecar_error(app, &msg);
+        emit_sidecar_error(
+            app,
+            "Something didn't finish building — Settings shows where my files live; quit Minion, delete the setup folder inside there if you're comfortable troubleshooting, then reopen.",
+        );
         return Err(msg);
     }
 
     emit(
         "installing",
-        "Installing dependencies (first launch, ~2 min; needs network)…",
+        "Downloading the pieces that let me read and remember your files… (needs internet; a few minutes)",
         2,
     );
     dbg("bootstrap", serde_json::json!({"state": "pip_start", "requirements": requirements}));
@@ -763,7 +777,7 @@ fn bootstrap_venv_impl(
         .output()
         .map_err(|e| {
             let msg = format!("pip launch failed: {e}");
-            emit_sidecar_error(app, &msg);
+            emit_sidecar_error(app, "Couldn't run the downloader — File logs may say why.");
             shell_log("ERROR", &msg);
             msg
         })?;
@@ -795,13 +809,17 @@ fn bootstrap_venv_impl(
                 "WARN",
                 "pip missing during bootstrap; removing venv and retrying setup once…",
             );
-            emit("bootstrapping", "Repairing Python environment…", 1);
+            emit(
+                "bootstrapping",
+                "Fixing setup and trying once more…",
+                1,
+            );
             fs::remove_dir_all(&venv_dir).map_err(|e| {
                 let msg = format!(
                     "Could not remove broken venv at {}: {e}",
                     venv_dir.display()
                 );
-                emit_sidecar_error(app, &msg);
+                emit_sidecar_error(app, "Couldn't reset my workspace folder — check File logs.");
                 shell_log("ERROR", &msg);
                 msg
             })?;
@@ -827,7 +845,12 @@ fn bootstrap_venv_impl(
             ssl_hint,
             tail
         );
-        emit_sidecar_error(app, &msg);
+        let human = if ssl_hint.is_empty() {
+            "Couldn't finish downloading my tools — open Settings → File logs for the story."
+        } else {
+            "Couldn't finish downloading — SSL / certificates often cause this on a fresh Mac Python. File logs spell it out."
+        };
+        emit_sidecar_error(app, human);
         dbg("bootstrap", serde_json::json!({"state": "pip_failed"}));
         return Err(msg);
     }
@@ -1823,7 +1846,7 @@ pub fn run() {
                         dbg("setup", serde_json::json!({"state": "no_state_timeout"}));
                         emit_sidecar_error(
                             &handle,
-                            "Startup timed out — quit Minion completely and reopen.",
+                            "Taking longer than usual to wake up — quit Minion fully and open it again.",
                         );
                         return;
                     }
@@ -1832,13 +1855,16 @@ pub fn run() {
                 emit_sidecar_status(
                     &handle,
                     "starting",
-                    Some("Say hello — I'm locating Minion's brain…"),
+                    Some("Finding everything I need inside this app…"),
                     0,
                 );
                 let src_dir = match resolve_sidecar_src_dir(&handle) {
                     Some(d) => d,
                     None => {
-                        emit_sidecar_error(&handle, "Could not locate Minion sidecar. Reinstall the app.");
+                        emit_sidecar_error(
+                            &handle,
+                            "Something's missing from this copy of Minion — reinstall from the installer.",
+                        );
                         return;
                     }
                 };
@@ -1851,7 +1877,7 @@ pub fn run() {
                     None => {
                         emit_sidecar_error(
                             &handle,
-                            "Bundled requirements.txt missing. Reinstall the app.",
+                            "Something's missing from this install — grab a fresh copy of Minion.",
                         );
                         return;
                     }
@@ -1861,7 +1887,10 @@ pub fn run() {
                     Ok(p) => p,
                     Err(e) => {
                         dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": &e}));
-                        emit_sidecar_error(&handle, &e);
+                        emit_sidecar_error(
+                            &handle,
+                            "Setup didn't finish — Settings → File logs has the details.",
+                        );
                         return;
                     }
                 };
@@ -1872,7 +1901,7 @@ pub fn run() {
                 emit_sidecar_status(
                     &handle,
                     "launching",
-                    Some("Almost there — waking up the memory server…"),
+                    Some("One more second — I'm opening the front door…"),
                     3,
                 );
                 let child =
@@ -1885,10 +1914,7 @@ pub fn run() {
                 } else {
                     emit_sidecar_error(
                         &handle,
-                        &format!(
-                            "Sidecar failed to start. See {}/ for sidecar.log and minion-desktop.log (Settings → File logs), or relaunch.",
-                            logs_dir(&data_dir_bg).display()
-                        ),
+                        "I couldn't start all the way. Open Settings → File logs, read the latest lines, then try relaunching Minion.",
                     );
                 }
             });
