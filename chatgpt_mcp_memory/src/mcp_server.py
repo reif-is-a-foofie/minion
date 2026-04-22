@@ -39,7 +39,6 @@ from store import (
     search as store_search,
 )
 import telemetry
-import identity
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
     USER_EDITS_SENTINEL,
@@ -843,48 +842,6 @@ def _tool_index_info(_: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_propose_identity_update(args: Dict[str, Any]) -> Dict[str, Any]:
-    conn = _get_conn()
-    payload, err = identity.propose_identity_update(
-        conn,
-        kind=str(args.get("kind") or ""),
-        text=str(args.get("text") or ""),
-        source_agent=args.get("source_agent"),
-        confidence=args.get("confidence"),
-        evidence_chunk_ids=args.get("evidence_chunk_ids"),
-        evidence_rationales=args.get("evidence_rationales"),
-        meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
-    )
-    if err:
-        return {"status": "error", "error": err}
-    assert payload is not None
-    return {"status": "ok", **payload}
-
-
-def _tool_list_identity_claims(args: Dict[str, Any]) -> Dict[str, Any]:
-    conn = _get_conn()
-    limit = args.get("limit")
-    try:
-        lim = int(limit) if limit is not None else 100
-    except (TypeError, ValueError):
-        lim = 100
-    rows, err = identity.list_claims(
-        conn,
-        status=args.get("status"),
-        kind=args.get("kind"),
-        limit=lim,
-    )
-    if err:
-        return {"status": "error", "error": err}
-    return {"status": "ok", "claims": rows, "count": len(rows)}
-
-
-def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
-    conn = _get_conn()
-    md = identity.build_identity_summary(conn)
-    return {"status": "ok", "markdown": md}
-
-
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "ask_minion",
@@ -1129,81 +1086,6 @@ TOOLS: List[Dict[str, Any]] = [
         "description": "Return aggregate metadata about the loaded local index.",
         "inputSchema": {"type": "object", "additionalProperties": False},
     },
-    {
-        "name": "propose_identity_update",
-        "title": "Propose a structured identity claim",
-        "description": (
-            "Append a candidate identity claim (preference, value, relationship, goal, "
-            "boundary, or fact) with optional evidence chunk_ids from prior `ask_minion` "
-            "hits. Status starts as proposed; the user approves or rejects in the Minion "
-            "desktop app. Always tie claims to evidence when possible."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["kind", "text"],
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": sorted(identity.CLAIM_KINDS),
-                    "description": "Category of claim.",
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Short, factual claim in plain language.",
-                },
-                "source_agent": {
-                    "type": ["string", "null"],
-                    "description": "Caller id (e.g. claude-desktop, cursor).",
-                },
-                "confidence": {
-                    "type": ["number", "null"],
-                    "description": "0–1 optional confidence.",
-                },
-                "evidence_chunk_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "chunk_id values from search hits (max 12).",
-                },
-                "evidence_rationales": {
-                    "type": "array",
-                    "items": {"type": ["string", "null"]},
-                    "description": "Parallel rationales for each evidence id (optional).",
-                },
-                "meta": {"type": "object", "additionalProperties": True},
-            },
-        },
-    },
-    {
-        "name": "list_identity_claims",
-        "title": "List identity claims",
-        "description": (
-            "List structured identity claims filtered by status and/or kind. "
-            "Use status='proposed' to see items awaiting user review."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["proposed", "active", "rejected", "superseded"],
-                    "description": "Omit to list all statuses.",
-                },
-                "kind": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
-            },
-        },
-    },
-    {
-        "name": "get_identity_summary",
-        "title": "Identity summary for grounding",
-        "description": (
-            "Return a markdown digest of active claims, pending proposals, and "
-            "the latest preference clusters. Use to ground answers about who the user is."
-        ),
-        "inputSchema": {"type": "object", "additionalProperties": False},
-    },
 ]
 
 
@@ -1409,14 +1291,6 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "condensed user brief (observed patterns from chat history) under "
             "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
         )
-    instructions += (
-        "\n\n## Digital identity graph\n\n"
-        "Structured claims about the user (preferences, values, relationships, goals, "
-        "boundaries, facts) can be stored with evidence links. Use `propose_identity_update` "
-        "after `ask_minion` surfaces relevant chunk_ids. Claims are `proposed` until the user "
-        "accepts them in the Minion app. `list_identity_claims` lists pending/active rows; "
-        "`get_identity_summary` returns a compact markdown digest for grounding."
-    )
     return _jsonrpc_result(
         req_id,
         {
@@ -1443,9 +1317,6 @@ _DISPATCH = {
     "conversation_chunks": _tool_conversation_chunks,
     "list_sources": _tool_list_sources,
     "index_info": _tool_index_info,
-    "propose_identity_update": _tool_propose_identity_update,
-    "list_identity_claims": _tool_list_identity_claims,
-    "get_identity_summary": _tool_get_identity_summary,
 }
 
 
