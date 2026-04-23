@@ -661,6 +661,14 @@ export type DiagnosticsLogBody = {
   count: number;
 };
 
+/** Parsed rows from GET /diagnostics/telemetry (local telemetry.jsonl). */
+export type DiagnosticsTelemetryBody = {
+  telemetry_file_hint: string | null;
+  rolled_file_hint: string | null;
+  events: Record<string, unknown>[];
+  count: number;
+};
+
 /** Public diagnostics GETs are intentionally unauthenticated (loopback-only). */
 async function diagFetchJson<T>(apiBase: string, path: string): Promise<T> {
   const base = apiBase.replace(/\/$/, "");
@@ -686,6 +694,18 @@ export async function fetchDiagnosticsPeers(apiBase?: string): Promise<Diagnosti
 
 export async function fetchDiagnosticsLogAtBase(apiBase: string, lines = 300): Promise<DiagnosticsLogBody> {
   return diagFetchJson<DiagnosticsLogBody>(apiBase, `/diagnostics/log?lines=${encodeURIComponent(String(lines))}`);
+}
+
+export async function fetchDiagnosticsTelemetryAtBase(
+  apiBase: string,
+  lines = 200,
+  redacted = false,
+): Promise<DiagnosticsTelemetryBody> {
+  const r = redacted ? "true" : "false";
+  return diagFetchJson<DiagnosticsTelemetryBody>(
+    apiBase,
+    `/diagnostics/telemetry?lines=${encodeURIComponent(String(lines))}&redacted=${r}`,
+  );
 }
 
 export async function fetchDiagnosticsLogTextAtBase(apiBase: string, lines = 400): Promise<string> {

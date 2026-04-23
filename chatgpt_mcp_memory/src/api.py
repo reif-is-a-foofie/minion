@@ -27,6 +27,8 @@ Endpoints:
   GET  /diagnostics/log             -> JSON: redacted tail of ``MINION_LOG_FILE`` sidecar log
   GET  /diagnostics/log/text        -> plain text tail (paste into tickets)
   GET  /diagnostics/log/stream      -> SSE: live redacted log lines (loopback use)
+  GET  /diagnostics/telemetry       -> JSON: tail of ``telemetry.jsonl`` (parsed events; may include queries/paths)
+  GET  /diagnostics/telemetry/stream -> SSE: live telemetry events (optional ``redacted=true``)
   GET  /diagnostics/peers           -> JSON: Minion sidecars on 127.0.0.1 (scan ``MINION_PEER_SCAN_PORT_LO/HI``)
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
   POST /ingest/webhook              -> JSON or NDJSON chunks (Bearer when MINION_API_TOKEN set)
@@ -73,6 +75,7 @@ from settings import apply_settings, load_settings, save_settings
 import analytics_remote
 import diagnostics
 import telemetry
+import telemetry_feed
 import identity
 from version import __version__
 from export_bundle import write_identity_export_zip
@@ -749,6 +752,8 @@ def capabilities() -> Dict[str, Any]:
             "diagnostics_log": "GET /diagnostics/log",
             "diagnostics_log_text": "GET /diagnostics/log/text",
             "diagnostics_log_stream": "GET /diagnostics/log/stream",
+            "diagnostics_telemetry": "GET /diagnostics/telemetry",
+            "diagnostics_telemetry_stream": "GET /diagnostics/telemetry/stream",
             "diagnostics_peers": "GET /diagnostics/peers",
         },
     }
@@ -765,7 +770,9 @@ def diagnostics_about() -> Dict[str, Any]:
         "privacy": (
             "Diagnostics routes are GET-only and meant for 127.0.0.1. "
             "Minion does not upload logs or telemetry to us automatically. "
-            "Log lines may still contain filenames you indexed; use redacted export when sharing."
+            "Log lines may still contain filenames you indexed; use redacted export when sharing. "
+            "GET /diagnostics/telemetry and /diagnostics/telemetry/stream read local telemetry.jsonl "
+            "(search queries and paths) unless you pass redacted=true — treat like sensitive support data."
         ),
     }
 
@@ -804,6 +811,38 @@ def diagnostics_log_stream() -> StreamingResponse:
 
     return StreamingResponse(
         diagnostics.iter_log_sse_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/diagnostics/telemetry")
+def diagnostics_telemetry(
+    lines: int = 200,
+    max_bytes: int = 256_000,
+    redacted: bool = False,
+) -> Dict[str, Any]:
+    """Tail of ``telemetry.jsonl`` as JSON objects (newest last)."""
+    n = max(1, min(2500, int(lines)))
+    mb = max(4096, min(2_000_000, int(max_bytes)))
+    return telemetry_feed.read_telemetry_tail(
+        State.data_dir,
+        max_lines=n,
+        max_bytes=mb,
+        redacted=bool(redacted),
+    )
+
+
+@app.get("/diagnostics/telemetry/stream")
+def diagnostics_telemetry_stream(redacted: bool = False) -> StreamingResponse:
+    """SSE stream of telemetry events (blocks a worker thread while connected)."""
+
+    return StreamingResponse(
+        telemetry_feed.iter_telemetry_sse_events(State.data_dir, redacted=bool(redacted)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

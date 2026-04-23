@@ -18,6 +18,7 @@
     fetchDiagnosticsAbout,
     fetchDiagnosticsLogAtBase,
     fetchDiagnosticsLogTextAtBase,
+    fetchDiagnosticsTelemetryAtBase,
     fetchDiagnosticsPeers,
     fetchCapabilities,
     fetchStatus,
@@ -115,6 +116,12 @@
   let supportPanelBusy = $state(false);
   let supportPanelError = $state<string | null>(null);
   let supportLogEs: EventSource | null = null;
+  /** When true, telemetry API omits/redacts query, path, top_path. */
+  let supportTelemetryRedacted = $state(true);
+  let supportTelemetrySnapshotLines = $state<string[]>([]);
+  let supportTelemetryStreamLines = $state<string[]>([]);
+  let supportTelemetryHint = $state<string | null>(null);
+  let supportTelemetryEs: EventSource | null = null;
 
   function stopSupportLogStream() {
     if (supportLogEs) {
@@ -162,11 +169,78 @@
     }
   }
 
+  function stopSupportTelemetryStream() {
+    if (supportTelemetryEs) {
+      supportTelemetryEs.close();
+      supportTelemetryEs = null;
+    }
+  }
+
+  function startSupportTelemetryStream(base: string) {
+    stopSupportTelemetryStream();
+    const r = supportTelemetryRedacted ? "true" : "false";
+    const url = `${base.replace(/\/$/, "")}/diagnostics/telemetry/stream?redacted=${r}`;
+    try {
+      const es = new EventSource(url);
+      supportTelemetryEs = es;
+      es.onmessage = (ev) => {
+        try {
+          const o = JSON.parse(ev.data) as {
+            event?: Record<string, unknown>;
+            heartbeat?: boolean;
+            error?: string;
+          };
+          if (o.error) {
+            supportTelemetryStreamLines = [
+              ...supportTelemetryStreamLines.slice(-400),
+              `[${o.error}]`,
+            ];
+            return;
+          }
+          if (o.heartbeat) return;
+          if (o.event) {
+            const line = JSON.stringify(o.event);
+            supportTelemetryStreamLines = [...supportTelemetryStreamLines.slice(-400), line];
+          }
+        } catch {
+          /* ignore malformed chunks */
+        }
+      };
+      es.onerror = () => {
+        /* keepalive; EventSource reconnects on its own */
+      };
+    } catch (e) {
+      pushFeed("settings", `telemetry stream failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function refreshSupportTelemetrySnapshot() {
+    if (!supportLogBase) return;
+    try {
+      const body = await fetchDiagnosticsTelemetryAtBase(supportLogBase, 160, supportTelemetryRedacted);
+      supportTelemetrySnapshotLines = body.events.map((e) => JSON.stringify(e));
+      supportTelemetryHint = body.telemetry_file_hint ?? null;
+    } catch (e) {
+      pushFeed("settings", `telemetry snapshot failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function setSupportTelemetryRedacted(redacted: boolean) {
+    supportTelemetryRedacted = redacted;
+    if (!supportLogBase) return;
+    stopSupportTelemetryStream();
+    await refreshSupportTelemetrySnapshot();
+    startSupportTelemetryStream(supportLogBase);
+  }
+
   async function loadSupportPanel() {
     supportPanelBusy = true;
     supportPanelError = null;
     stopSupportLogStream();
+    stopSupportTelemetryStream();
     supportStreamLines = [];
+    supportTelemetryStreamLines = [];
+    supportTelemetrySnapshotLines = [];
     try {
       const cfg = await getConfig();
       supportLogBase = cfg.api_base;
@@ -182,6 +256,8 @@
       telemetryOptOut = Boolean(setRes.settings.telemetry_opt_out);
       await refreshSupportSnapshot();
       startSupportLogStream(supportLogBase);
+      await refreshSupportTelemetrySnapshot();
+      startSupportTelemetryStream(supportLogBase);
     } catch (e) {
       supportPanelError = (e as Error).message;
     } finally {
@@ -193,10 +269,14 @@
     const base = loopbackApiBaseForPort(port);
     supportLogBase = base;
     supportStreamLines = [];
+    supportTelemetryStreamLines = [];
     stopSupportLogStream();
+    stopSupportTelemetryStream();
     supportPanelError = null;
     await refreshSupportSnapshot();
     startSupportLogStream(base);
+    await refreshSupportTelemetrySnapshot();
+    startSupportTelemetryStream(base);
   }
 
   async function copyRedactedSidecarLog() {
@@ -280,6 +360,7 @@
 
   function closeSettingsHub() {
     stopSupportLogStream();
+    stopSupportTelemetryStream();
     showSettings = false;
     evidencePopup = null;
   }
@@ -291,7 +372,10 @@
     if (nav === "ingest" && !settingsLoaded) await loadSettings();
     if (nav === "ingest" && !extensionsInfo && !extensionsLoading) void loadExtensionsInfo();
     if (nav === "support") await loadSupportPanel();
-    if (nav !== "support") stopSupportLogStream();
+    if (nav !== "support") {
+      stopSupportLogStream();
+      stopSupportTelemetryStream();
+    }
   }
 
   async function openSettings(nav?: SettingsNav) {
@@ -1043,12 +1127,14 @@
     return () => {
       clearInterval(spin);
       stopSupportLogStream();
+      stopSupportTelemetryStream();
       unlistens.forEach((fn) => fn());
     };
   });
 
   onDestroy(() => {
     stopSupportLogStream();
+    stopSupportTelemetryStream();
   });
 
   // Derived groupings.
@@ -1571,6 +1657,33 @@
                     Remote telemetry is disabled for this build (<span class="mono">MINION_DISABLE_REMOTE_ANALYTICS=1</span> or no collector URL).
                   </p>
                 {/if}
+
+                <div class="section-title small support-mt">Local product telemetry</div>
+                <p class="setting-desc">
+                  Read-only view of <span class="mono">telemetry.jsonl</span> on the selected instance (search/ingest and related events). Stays on
+                  <span class="mono">127.0.0.1</span>. Uncheck redaction only if you accept showing live queries and paths in this window.
+                </p>
+                <label class="support-analytics-row">
+                  <input
+                    type="checkbox"
+                    checked={supportTelemetryRedacted}
+                    onchange={(e) => void setSupportTelemetryRedacted((e.currentTarget as HTMLInputElement).checked)}
+                    disabled={supportPanelBusy}
+                  />
+                  <span>Redact query, path, and top_path</span>
+                </label>
+                <div class="support-actions">
+                  <button type="button" class="ghost" onclick={() => void refreshSupportTelemetrySnapshot()} disabled={supportPanelBusy || !supportLogBase}
+                    >Refresh telemetry snapshot</button
+                  >
+                </div>
+                {#if supportTelemetryHint}
+                  <p class="setting-desc mono subtle">Telemetry file: {supportTelemetryHint}</p>
+                {/if}
+                <div class="section-title small support-mt">Telemetry snapshot</div>
+                <pre class="bootstrap-log support-comms-log" aria-label="Telemetry snapshot">{supportTelemetrySnapshotLines.join("\n")}</pre>
+                <div class="section-title small support-mt">Telemetry live stream</div>
+                <pre class="bootstrap-log support-comms-log" aria-label="Telemetry live stream">{supportTelemetryStreamLines.join("\n")}</pre>
 
                 <div class="section-title small support-mt">App updates</div>
                 <p class="setting-desc">
