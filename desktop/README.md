@@ -86,16 +86,32 @@ Dev quirks:
   (Multipass VM name clash, stale sidecars, optional `MINION_EMBED_IDLE_SEC` /
   `MINION_EMBED_BATCH_SIZE`).
 
-## Release zips: Intel vs Apple Silicon
+## Release downloads: `.app` per architecture (manual install)
 
-[**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) ship two zips per version. File names spell out the hardware in plain language (users should not need “arm64” / “x64”):
+Users install **`Minion.app`** for their Mac’s CPU. GitHub cannot attach a bare
+`.app` folder, so each release ships **two zip files**; unzipping yields
+`Minion.app` to drag into **Applications**.
 
-| Filename contains | CPU | Typical Macs |
-|-------------------|-----|----------------|
+[**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) — pick **one** zip per machine:
+
+| Asset filename contains | CPU | Typical Macs |
+|-------------------------|-----|----------------|
 | **`macOS-Apple-Silicon`** | Apple Silicon | M1, M2, M3, M4, … — **About This Mac** shows **Chip:** Apple M… |
 | **`macOS-Intel`** | Intel | **About This Mac** shows **Processor:** … **Intel** … |
 
-**Prep for clients:** “If you see **Chip** in About This Mac, get the zip with **Apple-Silicon** in the name. If you see an **Intel** processor, get the zip with **Intel** in the name.”
+**Prep for clients:** “If you see **Chip** in About This Mac, download the zip whose name includes **Apple-Silicon**. If you see an **Intel** processor, download the one that includes **Intel**.”
+
+**Maintainer:** after both `tauri build` targets (below), produce the two zips:
+
+```bash
+cd desktop
+bash scripts/package_macos_app_zips.sh --version 1.0.1
+# → dist/Minion_1.0.1_macOS-Apple-Silicon.zip
+# → dist/Minion_1.0.1_macOS-Intel.zip
+```
+
+Attach those zips to the GitHub release (separate from the signed `.app.tar.gz`
+artifacts used only by the in-app updater + `latest.json`).
 
 ## Build
 
@@ -137,8 +153,9 @@ Signed updates use **`tauri-plugin-updater`**. The app reads
    ```
 
    Each build emits `Minion.app.tar.gz` and `.sig` under `src-tauri/target/.../bundle/macos/`.
+   Those **tarballs** are for the **auto-updater**, not for end-user drag-and-drop installs.
 
-3. **Publish** — upload both tarballs to a GitHub Release, then generate **`latest.json`**:
+3. **Publish** — attach **manual-install zips** (`package_macos_app_zips.sh` output) for users who want `.app` per architecture. For the updater, upload both **`.app.tar.gz`** + **`.sig`** files, then generate **`latest.json`**:
 
    ```bash
    python3 scripts/write_latest_json.py \
