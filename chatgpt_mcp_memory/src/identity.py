@@ -14,6 +14,7 @@ from store import (
     identity_claim_get,
     identity_claim_insert,
     identity_claim_list,
+    identity_claim_patch_fields,
     identity_claim_set_status,
     identity_edge_insert,
     identity_edges_for_claim,
@@ -158,6 +159,39 @@ def set_claim_status(
     return True, None
 
 
+def patch_claim(
+    conn: sqlite3.Connection,
+    claim_id: str,
+    *,
+    status: Optional[str] = None,
+    superseded_by: Optional[str] = None,
+    text: Optional[str] = None,
+    meta_merge: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Partial update: pass only fields to change. At least one field required."""
+    if status is not None and status not in CLAIM_STATUSES:
+        return None, f"status must be one of: {sorted(CLAIM_STATUSES)}"
+    if text is not None:
+        err = validate_text(text)
+        if err:
+            return None, err
+    if all(x is None for x in (status, superseded_by, text, meta_merge)):
+        return None, "at least one of status, superseded_by, text, meta required"
+    if identity_claim_get(conn, claim_id) is None:
+        return None, "claim_id not found"
+    ok = identity_claim_patch_fields(
+        conn,
+        claim_id,
+        text=text,
+        status=status,
+        superseded_by=superseded_by,
+        meta_merge=meta_merge,
+    )
+    if not ok:
+        return None, "claim_id not found"
+    return identity_claim_get(conn, claim_id), None
+
+
 def build_identity_summary(
     conn: sqlite3.Connection,
     *,
@@ -172,7 +206,16 @@ def build_identity_summary(
     if active:
         lines.append("### Active claims")
         for c in active:
-            lines.append(f"- **{c['kind']}**: {c['text']}")
+            meta = c.get("meta") or {}
+            rel = meta.get("relation")
+            labels = meta.get("labels")
+            suffix = ""
+            if rel:
+                suffix += f" _(relation: {rel})_"
+            if isinstance(labels, list) and labels:
+                lab = ", ".join(str(x) for x in labels[:12])
+                suffix += f" `{lab}`"
+            lines.append(f"- **{c['kind']}**: {c['text']}{suffix}")
     else:
         lines.append("### Active claims\n- _(none yet)_")
 
@@ -180,7 +223,15 @@ def build_identity_summary(
         lines.append("### Pending proposals (need user review)")
         for c in proposed:
             who = f" — _via {c['source_agent']}_" if c.get("source_agent") else ""
-            lines.append(f"- **{c['kind']}** (`{c['claim_id']}`){who}: {c['text']}")
+            meta = c.get("meta") or {}
+            rel = meta.get("relation")
+            labels = meta.get("labels")
+            sfx = ""
+            if rel:
+                sfx += f" _(relation: {rel})_"
+            if isinstance(labels, list) and labels:
+                sfx += f" `{', '.join(str(x) for x in labels[:12])}`"
+            lines.append(f"- **{c['kind']}** (`{c['claim_id']}`){who}: {c['text']}{sfx}")
 
     if clusters:
         lines.append("### Preference clusters (derived)")

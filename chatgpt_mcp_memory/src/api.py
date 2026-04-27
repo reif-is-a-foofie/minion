@@ -10,12 +10,12 @@ Endpoints:
   GET  /status                      -> counts, inbox path, db path, watcher
   GET  /sources                     -> list sources (kind / path_glob / since / limit)
   GET  /sources/{source_id}         -> source metadata
-  DELETE /sources                   -> body: {"path": "..."} OR {"source_id": "..."}
+  DELETE /sources                   -> body: {"path": "..."} OR {"source_id": "..."} OR bulk {"kind": "text", "confirm_bulk": true}
   POST /search                      -> body: {"query", "top_k", "kind"?, "path_glob"?, "role"?}
   GET  /search/stream               -> SSE: events `meta`, `hit` (JSON per line), `done`, optional `error`
   GET  /identity/claims             -> list identity claims (optional ?status=&kind=)
   POST /identity/claims/propose     -> same shape as MCP propose_identity_update
-  PATCH /identity/claims/{claim_id} -> {"status": "active"|"rejected"|...}
+  PATCH /identity/claims/{claim_id} -> {"status"? , "text"? , "meta"? , "superseded_by"? }
   GET  /identity/claims/{claim_id}/edges
   GET  /identity/summary            -> { "markdown": "..." }
   GET  /identity/clusters
@@ -64,7 +64,7 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_export
 from parser_extensions import manifest_path
@@ -85,6 +85,7 @@ from store import (
     count_sources,
     delete_source,
     delete_source_by_path,
+    delete_sources_by_kind,
     fts_available,
     get_chunk,
     get_source,
@@ -500,6 +501,25 @@ def _iter_files_in_tree(root: Path) -> List[Path]:
 class DeleteBody(BaseModel):
     path: Optional[str] = None
     source_id: Optional[str] = None
+    """Bulk: remove every source with this ``kind`` (e.g. ``text``). Requires ``confirm_bulk``."""
+
+    kind: Optional[str] = None
+    confirm_bulk: bool = False
+
+    @model_validator(mode="after")
+    def _delete_exactly_one_target(self) -> "DeleteBody":
+        modes = sum(
+            1
+            for x in (self.path, self.source_id, self.kind)
+            if x is not None and str(x).strip() != ""
+        )
+        if modes != 1:
+            raise ValueError(
+                "provide exactly one of: path, source_id, kind (bulk forget-all of that kind)"
+            )
+        if self.kind is not None and not self.confirm_bulk:
+            raise ValueError("bulk delete by kind requires confirm_bulk: true")
+        return self
 
 
 class ConnectBody(BaseModel):
@@ -527,8 +547,23 @@ class IdentityProposeBody(BaseModel):
 
 
 class IdentityPatchBody(BaseModel):
-    status: str
+    status: Optional[str] = None
     superseded_by: Optional[str] = None
+    text: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _patch_one_field(self) -> "IdentityPatchBody":
+        if (
+            self.status is None
+            and self.superseded_by is None
+            and self.text is None
+            and self.meta is None
+        ):
+            raise ValueError(
+                "provide at least one of: status, superseded_by, text, meta"
+            )
+        return self
 
 
 class ClusterRebuildBody(BaseModel):
@@ -736,6 +771,7 @@ def capabilities() -> Dict[str, Any]:
             "search": "POST /search",
             "search_stream": "GET /search/stream",
             "ingest": "POST /ingest",
+            "delete_sources_bulk": "DELETE /sources body {kind, confirm_bulk:true}",
             "ingest_webhook": "POST /ingest/webhook",
             "extensions": "GET /extensions",
             "extensions_reload": "POST /extensions/reload",
@@ -915,14 +951,25 @@ def source_info(source_id: str) -> Dict[str, Any]:
 
 @app.delete("/sources")
 def delete_endpoint(body: DeleteBody) -> Dict[str, Any]:
-    if not body.path and not body.source_id:
-        raise HTTPException(status_code=400, detail="path or source_id required")
+    conn = State.conn()
+    if body.kind is not None:
+        n_src, n_chunks = delete_sources_by_kind(conn, body.kind.strip())
+        _schedule_broadcast(
+            {
+                "type": "sources_bulk_removed",
+                "kind": body.kind.strip(),
+                "sources_removed": n_src,
+                "counts": _counts(),
+            }
+        )
+        return {"removed_chunks": n_chunks, "sources_removed": n_src, "kind": body.kind.strip()}
     if body.source_id:
-        n = delete_source(State.conn(), body.source_id)
+        n = delete_source(conn, body.source_id)
         key = body.source_id
     else:
+        assert body.path is not None
         p = str(Path(body.path).expanduser().resolve())
-        n = delete_source_by_path(State.conn(), p)
+        n = delete_source_by_path(conn, p)
         key = p
     _schedule_broadcast({"type": "source_removed", "key": key, "counts": _counts()})
     return {"removed_chunks": n}
@@ -1132,24 +1179,26 @@ def identity_propose(body: IdentityProposeBody) -> Dict[str, Any]:
 
 @app.patch("/identity/claims/{claim_id}")
 def identity_patch_claim(claim_id: str, body: IdentityPatchBody) -> Dict[str, Any]:
-    ok, err = identity.set_claim_status(
-        State.conn(),
+    conn = State.conn()
+    row, err = identity.patch_claim(
+        conn,
         claim_id,
         status=body.status,
         superseded_by=body.superseded_by,
+        text=body.text,
+        meta_merge=body.meta,
     )
     if err:
         raise HTTPException(status_code=404 if "not found" in (err or "") else 400, detail=err)
-    if not ok:
+    if row is None:
         raise HTTPException(status_code=404, detail="claim not found")
-    State.conn().commit()
+    conn.commit()
     telemetry.log_event(
-        "identity_status",
+        "identity_patch",
         claim_id=claim_id,
-        status=body.status,
+        status=body.status or row.get("status"),
     )
-    row = identity_claim_get(State.conn(), claim_id)
-    return {"claim": row}
+    return {"claim": identity_claim_get(conn, claim_id)}
 
 
 @app.get("/identity/summary")

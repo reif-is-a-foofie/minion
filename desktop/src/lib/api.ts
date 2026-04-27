@@ -278,7 +278,12 @@ export async function fetchIdentityClaims(params: {
 
 export async function patchIdentityClaim(
   claimId: string,
-  body: { status: string; superseded_by?: string },
+  body: {
+    status?: string;
+    superseded_by?: string;
+    text?: string;
+    meta?: Record<string, unknown>;
+  },
 ): Promise<{ claim: IdentityClaim | null }> {
   return apiFetch(`/identity/claims/${encodeURIComponent(claimId)}`, {
     method: "PATCH",
@@ -438,7 +443,12 @@ export async function connectClaudeDesktop(body: { server_name?: string; config_
   });
 }
 
-export async function deleteSource(body: { path?: string; source_id?: string }): Promise<{ removed_chunks: number }> {
+export async function deleteSource(body: {
+  path?: string;
+  source_id?: string;
+  kind?: string;
+  confirm_bulk?: boolean;
+}): Promise<{ removed_chunks: number; sources_removed?: number; kind?: string }> {
   return apiFetch("/sources", {
     method: "DELETE",
     body: JSON.stringify(body),

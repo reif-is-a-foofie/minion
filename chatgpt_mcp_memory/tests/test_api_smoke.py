@@ -279,3 +279,99 @@ def test_events_ws_streams_ingest(sidecar, staged_note: Path) -> None:
     assert "snapshot" in types, f"no snapshot event: {types}"
     assert "ingest_started" in types, f"no ingest_started event: {types}"
     assert "source_updated" in types, f"no source_updated event: {types}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Identity claims + summary (API contract)
+# ---------------------------------------------------------------------------
+
+
+def test_identity_propose_patch_summary(sidecar) -> None:
+    prop = sidecar.post(
+        "/identity/claims/propose",
+        {
+            "kind": "fact",
+            "text": "E2E identity claim about household.",
+            "meta": {"relation": "partner", "labels": ["family", "e2e"]},
+        },
+    )
+    assert prop.status_code == 200, prop.text
+    cid = prop.json()["claim_id"]
+    patched = sidecar.patch(
+        f"/identity/claims/{cid}",
+        {"status": "active"},
+    )
+    assert patched.status_code == 200, patched.text
+    summ = sidecar.get("/identity/summary").json()
+    md = summ["markdown"]
+    assert "partner" in md
+    assert "household" in md
+
+
+def test_identity_patch_text(sidecar) -> None:
+    prop = sidecar.post(
+        "/identity/claims/propose",
+        {"kind": "boundary", "text": "Original boundary text for patch."},
+    )
+    assert prop.status_code == 200, prop.text
+    cid = prop.json()["claim_id"]
+    patched = sidecar.patch(
+        f"/identity/claims/{cid}",
+        {"text": "Updated boundary wording from e2e."},
+    )
+    assert patched.status_code == 200, patched.text
+    assert "Updated boundary" in patched.json()["claim"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Bulk DELETE /sources by kind
+# ---------------------------------------------------------------------------
+
+
+def test_delete_sources_by_kind_requires_confirm(sidecar) -> None:
+    r = sidecar.delete("/sources", {"kind": "text", "confirm_bulk": False})
+    assert r.status_code == 422
+
+
+def test_delete_sources_by_kind_bulk(sidecar, staged_note: Path) -> None:
+    shutil.copy2(staged_note, sidecar.inbox / "bulk-a.md")
+    shutil.copy2(staged_note, sidecar.inbox / "bulk-b.md")
+    sidecar.post("/reconcile", {"force": False}).raise_for_status()
+    srcs = sidecar.wait_for_sources(2, timeout=45.0)
+    assert len(srcs) == 2
+    r = sidecar.delete("/sources", {"kind": "text", "confirm_bulk": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("sources_removed") == 2
+    assert body["removed_chunks"] >= 1
+    after = sidecar.get("/sources").json()
+    assert after["counts"]["sources"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. Webhook ingest + extensions reload
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_webhook_json(sidecar) -> None:
+    r = sidecar.post(
+        "/ingest/webhook",
+        {
+            "source_key": "pytest-webhook-e2e",
+            "kind": "external",
+            "chunks": [{"text": "Webhook fixture chunk for pytest.", "role": None, "meta": {}}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("ok") is True
+    sidecar.wait_for_sources(1, timeout=45.0)
+    hits = sidecar.post("/search", {"query": "Webhook fixture chunk", "top_k": 4}).json()["results"]
+    assert hits and any("Webhook fixture" in h["text"] for h in hits)
+
+
+def test_extensions_reload(sidecar) -> None:
+    r = sidecar.post("/extensions/reload", {})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "reloaded" in body
+    assert "manifest_path" in body

@@ -885,6 +885,19 @@
     await refreshSources();
   }
 
+  async function forgetAllOfKind(kind: string) {
+    const n = grouped()[kind]?.length ?? 0;
+    if (
+      !confirm(
+        `Forget all ${n} indexed ${kind} source(s)?\n(This removes them from Minion only; files on disk stay.)`,
+      )
+    )
+      return;
+    await deleteSource({ kind, confirm_bulk: true });
+    filterKind = "";
+    await refreshSources();
+  }
+
   onMount(() => {
     let unlistens: Array<() => void> = [];
 
@@ -1348,6 +1361,14 @@
                       {KIND_LABELS[k] ?? k} <span class="count">{grouped()[k].length}</span>
                     </button>
                   {/each}
+                  {#if filterKind}
+                    <button
+                      type="button"
+                      class="ghost danger"
+                      title={`Remove every indexed ${filterKind} source`}
+                      onclick={() => void forgetAllOfKind(filterKind)}
+                    >Forget all {KIND_LABELS[filterKind] ?? filterKind}</button>
+                  {/if}
                 </div>
               </div>
               {#if sources.length === 0}
@@ -1397,6 +1418,14 @@
                         {/if}
                       </div>
                       <p class="claim-text">{c.text}</p>
+                      {#if c.meta && (c.meta.relation != null || (Array.isArray(c.meta.labels) && c.meta.labels.length))}
+                        <p class="meta identity-meta-line">
+                          {#if c.meta.relation != null}<span class="kind">relation: {String(c.meta.relation)}</span>{/if}
+                          {#if Array.isArray(c.meta.labels) && c.meta.labels.length}
+                            <span class="meta">{c.meta.labels.map((x) => String(x)).join(", ")}</span>
+                          {/if}
+                        </p>
+                      {/if}
                       <div class="file-actions">
                         <button type="button" class="ghost" onclick={() => showClaimEvidence(c.claim_id)}>Evidence</button>
                         {#if identityTab === "proposed"}
@@ -2489,6 +2518,12 @@
   }
   .identity-toolbar {
     margin-bottom: 14px;
+  }
+  .identity-meta-line {
+    margin-top: 6px;
+    margin-bottom: 0;
+    opacity: 0.88;
+    font-size: 12px;
   }
   .ingest-types-head {
     margin-top: 6px;

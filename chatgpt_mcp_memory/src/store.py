@@ -670,6 +670,18 @@ def delete_source_by_path(conn: sqlite3.Connection, path: str) -> int:
     return delete_source(conn, src.source_id)
 
 
+def delete_sources_by_kind(conn: sqlite3.Connection, kind: str) -> Tuple[int, int]:
+    """Remove every source of ``kind``. Returns ``(sources_removed, chunks_removed)``."""
+    rows = conn.execute(
+        "SELECT source_id FROM sources WHERE kind=?", (kind,)
+    ).fetchall()
+    ids = [str(r["source_id"]) for r in rows]
+    chunk_total = 0
+    for sid in ids:
+        chunk_total += delete_source(conn, sid)
+    return len(ids), chunk_total
+
+
 def upsert_source(
     conn: sqlite3.Connection,
     *,
@@ -1222,6 +1234,43 @@ def identity_claim_list(
     return [_row_identity_claim(r) for r in conn.execute(sql, params).fetchall()]
 
 
+def identity_claim_patch_fields(
+    conn: sqlite3.Connection,
+    claim_id: str,
+    *,
+    text: Optional[str] = None,
+    status: Optional[str] = None,
+    superseded_by: Optional[str] = None,
+    meta_merge: Optional[Dict[str, Any]] = None,
+) -> bool:
+    row = conn.execute(
+        "SELECT text, status, superseded_by, meta_json FROM identity_claims WHERE claim_id=?",
+        (claim_id,),
+    ).fetchone()
+    if not row:
+        return False
+    new_text = text if text is not None else row["text"]
+    new_status = status if status is not None else row["status"]
+    new_sup = superseded_by if superseded_by is not None else row["superseded_by"]
+    meta = json.loads(row["meta_json"] or "{}")
+    if meta_merge:
+        meta.update(meta_merge)
+    now = time.time()
+    conn.execute(
+        "UPDATE identity_claims SET text=?, status=?, superseded_by=?, "
+        "updated_at=?, meta_json=? WHERE claim_id=?",
+        (
+            new_text,
+            new_status,
+            new_sup,
+            now,
+            json.dumps(meta, ensure_ascii=False),
+            claim_id,
+        ),
+    )
+    return True
+
+
 def identity_claim_set_status(
     conn: sqlite3.Connection,
     claim_id: str,
@@ -1229,17 +1278,9 @@ def identity_claim_set_status(
     status: str,
     superseded_by: Optional[str] = None,
 ) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM identity_claims WHERE claim_id=?", (claim_id,)
-    ).fetchone()
-    if not row:
-        return False
-    now = time.time()
-    conn.execute(
-        "UPDATE identity_claims SET status=?, updated_at=?, superseded_by=? WHERE claim_id=?",
-        (status, now, superseded_by, claim_id),
+    return identity_claim_patch_fields(
+        conn, claim_id, status=status, superseded_by=superseded_by
     )
-    return True
 
 
 def identity_edge_insert(
