@@ -79,3 +79,4 @@ Keep these invariants when you change anything:
 - `desktop/` — Tauri app (Rust shell + SvelteKit UI).
 - `chatgpt_mcp_memory/src/telemetry.py` — the feedback-loop log.
 - `~/Library/Application Support/Minion/data/` — live DB, inbox, telemetry.
+- `third_party/awesome-cursor-skills/` — curated Cursor **skills** index (submodule); agents should skim `README.md` before multi-step work (see `.cursor/rules/consult-awesome-skills.mdc`).

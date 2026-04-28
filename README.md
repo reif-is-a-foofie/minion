@@ -73,7 +73,9 @@ If you pick the wrong one, macOS may refuse to open the app or show an architect
 
 ```bash
 git clone https://github.com/reif-is-a-foofie/Minion.git
-cd Minion/chatgpt_mcp_memory
+cd Minion
+git submodule update --init --recursive
+cd chatgpt_mcp_memory
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
