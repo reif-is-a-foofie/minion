@@ -103,3 +103,5 @@ Indexing and search run **on your machine**. MCP speaks **stdio** to Claude Desk
 ## Credits
 
 Built and dogfooded by **Reif** — questions: [reif@thegoodproject.net](mailto:reif@thegoodproject.net).
+
+**Cursor skills catalog:** [Awesome Cursor Skills](https://github.com/spencerpauly/awesome-cursor-skills) by **[Spencer Pauly](https://github.com/spencerpauly)** — vendored in-repo as a git submodule at [`third_party/awesome-cursor-skills`](third_party/awesome-cursor-skills) so agents can scan curated `SKILL.md` workflows. Third-party list; not affiliated with Minion.

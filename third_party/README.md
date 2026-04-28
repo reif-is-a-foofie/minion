@@ -2,7 +2,9 @@
 
 ## awesome-cursor-skills
 
-Git submodule: [spencerpauly/awesome-cursor-skills](https://github.com/spencerpauly/awesome-cursor-skills).
+Curated by **[Spencer Pauly](https://github.com/spencerpauly)** — [awesome-cursor-skills](https://github.com/spencerpauly/awesome-cursor-skills) on GitHub.
+
+Git submodule (exact upstream revision is pinned by git):
 
 Initialize or update after clone:
 
