@@ -1163,6 +1163,18 @@ fn ollama_has_model(bin: &Path, model: &str) -> bool {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
 #[tauri::command]
 fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
     let sidecar_bootstrapped = state
@@ -1185,6 +1197,7 @@ fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
         "api_token": state.api_token,
         "sidecar_bootstrapped": sidecar_bootstrapped,
         "sidecar_running": sidecar_running,
+        "auto_install_updates": env_truthy("MINION_AUTO_INSTALL_UPDATES"),
     })
 }
 

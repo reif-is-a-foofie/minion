@@ -66,6 +66,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from fastembed_cache import fastembed_cache_dir, register_fastembed_data_dir
 from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_export
 from parser_extensions import manifest_path
 from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_extension_mappings
@@ -148,6 +149,7 @@ def _resolve_paths() -> None:
         else:
             State.data_dir = Path.home() / ".minion" / "data"
     State.data_dir.mkdir(parents=True, exist_ok=True)
+    register_fastembed_data_dir(State.data_dir)
 
     inbox_env = os.environ.get("MINION_INBOX")
     State.inbox = (
@@ -992,7 +994,9 @@ def _get_query_model():
             or os.environ.get("MINION_EMBED_MODEL")
             or "sentence-transformers/all-MiniLM-L6-v2"
         )
-        _query_model = TextEmbedding(model_name=name)
+        _query_model = TextEmbedding(
+            model_name=name, cache_dir=fastembed_cache_dir(data_dir=State.data_dir)
+        )
         return _query_model
 
 

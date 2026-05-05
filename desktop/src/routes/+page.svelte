@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listen } from "$lib/tauri-bridge";
   import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
   import {
     connectClaudeDesktop,
@@ -105,6 +105,8 @@
   /** From GET /capabilities — collector URL is available (not air-gapped / disabled). */
   let analyticsUrlConfigured = $state(true);
   let updaterBusy = $state(false);
+  /** First automatic updater run after launch skips the inter-check cooldown. */
+  let updaterStartupBypassPending = true;
 
   let supportAbout = $state<DiagnosticsAbout | null>(null);
   let supportPeers = $state<DiagnosticsPeersResponse | null>(null);
@@ -210,17 +212,25 @@
     }
   }
 
-  /** Tauri signed updater (GitHub `latest.json`). Throttled unless `force`. */
-  async function maybeCheckForAppUpdate(force: boolean) {
+  /** Min gap between automatic checks (manual "Check now" always runs). */
+  const UPDATER_MIN_INTERVAL_MS = 15 * 60 * 1000;
+
+  /** Tauri signed updater (GitHub `latest.json`). */
+  async function maybeCheckForAppUpdate(
+    force: boolean,
+    opts?: { bypassThrottle?: boolean },
+  ) {
     if (import.meta.env.DEV) return;
     if (updaterBusy) return;
     const key = "minion_last_update_check";
-    if (!force) {
+    if (!force && !opts?.bypassThrottle) {
       const last = Number(localStorage.getItem(key) || "0");
-      if (Date.now() - last < 12 * 3600 * 1000) return;
+      if (Date.now() - last < UPDATER_MIN_INTERVAL_MS) return;
     }
     updaterBusy = true;
     try {
+      const cfg = await getConfig();
+      const autoInstall = Boolean(cfg.auto_install_updates);
       const { check } = await import("@tauri-apps/plugin-updater");
       const { relaunch } = await import("@tauri-apps/plugin-process");
       const update = await check({ timeout: 45_000 });
@@ -229,13 +239,22 @@
         localStorage.setItem(key, String(Date.now()));
         return;
       }
-      const go = await ask(
-        `Minion ${update.version} is available.${update.body ? `\n\n${update.body}` : ""}\n\nDownload and install now? (macOS may ask for permission.)`,
-        { title: "Update available", kind: "info" },
-      );
+      let go = autoInstall;
+      if (!go) {
+        go = await ask(
+          `Minion ${update.version} is available.${update.body ? `\n\n${update.body}` : ""}\n\nDownload and install now? (macOS may ask for permission.)`,
+          { title: "Update available", kind: "info" },
+        );
+      }
       if (!go) {
         localStorage.setItem(key, String(Date.now()));
         return;
+      }
+      if (autoInstall) {
+        pushFeed(
+          "settings",
+          `Auto-installing Minion ${update.version} (MINION_AUTO_INSTALL_UPDATES is set)…`,
+        );
       }
       await update.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
@@ -1101,12 +1120,37 @@
     if (updaterAutoTimer !== null) return;
     updaterAutoTimer = setTimeout(() => {
       updaterAutoTimer = null;
-      void maybeCheckForAppUpdate(false);
-    }, 18_000);
+      void maybeCheckForAppUpdate(false, {
+        bypassThrottle: updaterStartupBypassPending,
+      });
+      updaterStartupBypassPending = false;
+    }, 8_000);
     return () => {
       if (updaterAutoTimer !== null) {
         clearTimeout(updaterAutoTimer);
         updaterAutoTimer = null;
+      }
+    };
+  });
+
+  /** Keep long-running sessions current (~GitHub latest.json poll). */
+  let updaterPollTimer: ReturnType<typeof setInterval> | null = null;
+  $effect(() => {
+    if (import.meta.env.DEV || conn !== "open") {
+      if (updaterPollTimer !== null) {
+        clearInterval(updaterPollTimer);
+        updaterPollTimer = null;
+      }
+      return;
+    }
+    if (updaterPollTimer !== null) return;
+    updaterPollTimer = setInterval(() => {
+      void maybeCheckForAppUpdate(false);
+    }, 45 * 60 * 1000);
+    return () => {
+      if (updaterPollTimer !== null) {
+        clearInterval(updaterPollTimer);
+        updaterPollTimer = null;
       }
     };
   });
@@ -1603,9 +1647,9 @@
 
                 <div class="section-title small support-mt">App updates</div>
                 <p class="setting-desc">
-                  Release builds check GitHub for a signed <span class="mono">latest.json</span> (see
-                  <span class="mono">desktop/scripts/write_latest_json.py</span>). You stay on the stable channel unless you change the
-                  updater endpoints in <span class="mono">tauri.conf.json</span>.
+                  Release builds poll GitHub for a signed <span class="mono">latest.json</span> shortly after connect and about every 45 minutes while open (see
+                  <span class="mono">desktop/scripts/write_latest_json.py</span>). Fleet installs can set
+                  <span class="mono">MINION_AUTO_INSTALL_UPDATES=1</span> so updates install without a prompt (macOS may still ask for permission).
                 </p>
                 <div class="support-actions">
                   <button type="button" class="ghost" onclick={() => void maybeCheckForAppUpdate(true)} disabled={updaterBusy}>

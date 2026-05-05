@@ -46,6 +46,8 @@ desktop/src-tauri/gen/
 desktop/src-tauri/resources/sidecar/
 # Playwright / UI test output (local)
 desktop/test-results/
+desktop/playwright-report/
+desktop/blob-report/
 
 # Cloudflare Worker dev deps (npm install inside telemetry-collector/)
 telemetry-collector/node_modules/

@@ -2,8 +2,7 @@
 // (app_config command) so we stay in sync with whatever port the sidecar
 // actually bound to.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "./tauri-bridge";
 
 export type SidecarStatus = {
   state: "starting" | "bootstrapping" | "installing" | "ready" | "error";
@@ -27,6 +26,8 @@ export type AppConfig = {
   api_token: string;
   sidecar_bootstrapped: boolean;
   sidecar_running: boolean;
+  /** From Rust env MINION_AUTO_INSTALL_UPDATES — fleet installs skip the update dialog. */
+  auto_install_updates?: boolean;
 };
 
 export type Source = {

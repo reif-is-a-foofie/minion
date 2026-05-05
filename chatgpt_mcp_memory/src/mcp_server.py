@@ -22,6 +22,7 @@ warnings.filterwarnings(
 
 from fastembed import TextEmbedding
 
+from fastembed_cache import fastembed_cache_dir, register_fastembed_data_dir
 from store import (
     DB_FILENAME,
     browse_chunks_chronological as store_browse_chronological,
@@ -293,6 +294,7 @@ def _get_conn() -> sqlite3.Connection:
             return _CONN
         data_dir = _data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
+        register_fastembed_data_dir(data_dir)
         _maybe_auto_migrate(data_dir)
         telemetry.configure(data_dir)
         db_path = data_dir / DB_FILENAME
@@ -338,7 +340,9 @@ def _get_model() -> TextEmbedding:
         )
         if _MODEL is not None and _MODEL_NAME == name:
             return _MODEL
-        _MODEL = TextEmbedding(model_name=name)
+        _MODEL = TextEmbedding(
+            model_name=name, cache_dir=fastembed_cache_dir(data_dir=_data_dir())
+        )
         _MODEL_NAME = name
         return _MODEL
 
