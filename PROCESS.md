@@ -38,6 +38,13 @@ Optional after risky UI changes: `cd desktop && npm run test:e2e` (Playwright st
 
 Use **`chatgpt_mcp_memory/.venv/bin/python`**, not bare macOS `python3`, for pytest (SQLite extension preflight).
 
+### Cursor hooks (automatic backup verify)
+
+Project hooks in `.cursor/hooks.json` queue touched workspace paths on edit and run **tiered** checks once when the agent **`stop`** hook fires (see `.cursor/hooks/run-staged-verify.sh`). Hooks are **fail-open**: they log to `.cursor/hooks/verify-last.log` and never block Cursor.
+
+- **`MINION_HOOK_VERIFY=0`** — skip heavy hook verification for a session.
+- **`jq`** required for queue capture; without `jq`, queue silently no-ops.
+
 ## 5. Integration narrative
 
 In the PR / final reply:
